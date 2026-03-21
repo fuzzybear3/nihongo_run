@@ -99,7 +99,6 @@ fn main() {
                         title: "Nihongo Run".into(),
                         resolution: (w, h).into(),
                         resizable: false,
-                        canvas: Some("#bevy".to_string()),
                         ..default()
                     }),
                     ..default()
@@ -226,18 +225,16 @@ fn input_system(
     }
 
     if !touch_handled {
-        if mouse.just_pressed(MouseButton::Left) {
-            if let Some(pos) = window.cursor_position() {
+        if mouse.just_pressed(MouseButton::Left)
+            && let Some(pos) = window.cursor_position() {
                 drag.active = true;
                 drag.start_x = pos.x - half_w;
                 drag.current_x = drag.start_x;
             }
-        }
-        if mouse.pressed(MouseButton::Left) {
-            if let Some(pos) = window.cursor_position() {
+        if mouse.pressed(MouseButton::Left)
+            && let Some(pos) = window.cursor_position() {
                 drag.current_x = pos.x - half_w;
             }
-        }
         if mouse.just_released(MouseButton::Left) {
             drag.active = false;
         }
@@ -311,7 +308,7 @@ fn manage_tiles_system(
     // Player moves toward -Z, so "ahead" = lower (more negative) Z.
     while manager.frontier_z > pz - TILES_AHEAD as f32 * TILE_LENGTH {
         let center_z = manager.frontier_z;
-        let mat = if manager.count % 2 == 0 {
+        let mat = if manager.count.is_multiple_of(2) {
             assets.mat_a.clone()
         } else {
             assets.mat_b.clone()
