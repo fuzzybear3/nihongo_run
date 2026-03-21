@@ -34,7 +34,7 @@
 </head>
 <body>
   <div id="loading">loading...</div>
-  <script data-trunk rel="rust" data-wasm-opt="-Oz"></script>
+  <link data-trunk rel="rust" data-wasm-opt="-Oz" />
   <script>
     const observer = new MutationObserver(() => {
       if (document.querySelector('canvas')) {
