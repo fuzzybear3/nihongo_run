@@ -3,8 +3,9 @@ name = "nihongo_run"
 version = "0.1.0"
 edition = "2024"
 
-# Compile with Performance Optimizations:
-# https://bevyengine.org/learn/book/getting-started/setup/#compile-with-performance-optimizations
+[features]
+# Trunk enables this automatically via data-cargo-features="webgl2" in index.html
+webgl2 = ["bevy/webgl2"]
 
 # Enable a small amount of optimization in debug mode
 [profile.dev]
@@ -19,6 +20,7 @@ opt-level = "z"
 lto = true
 codegen-units = 1
 panic = "abort"
+strip = true
 
 [dependencies]
 bevy = "0.18"

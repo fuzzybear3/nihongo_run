@@ -1,40 +1,43 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta charset="utf-8" />
+  <!-- user-scalable=no prevents pinch-zoom interfering with touch controls -->
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no" />
   <title>Nihongo Run</title>
   <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
     html, body {
       width: 100%;
       height: 100%;
-      margin: 0;
-      padding: 0;
-      background-color: #000;
-      overflow: hidden;
+      background: #000;
       display: flex;
       justify-content: center;
       align-items: center;
-      font-family: monospace;
+      overflow: hidden;
+      touch-action: none;
     }
     canvas {
+      /* Fill the viewport while keeping the canvas's own aspect ratio.
+         width drives the scale; height follows proportionally via auto. */
       width: min(100vw, 50vh);
       height: auto;
       display: block;
-      touch-action: none;
-      user-select: none;
-      -webkit-tap-highlight-color: transparent;
     }
     #loading {
-      color: #fff;
-      font-size: 24px;
+      position: absolute;
+      color: #555;
+      font-family: monospace;
+      font-size: 14px;
+      letter-spacing: 0.1em;
     }
   </style>
+  <!-- trunk replaces this link with the compiled WASM + JS glue -->
+  <link data-trunk rel="rust" data-cargo-features="webgl2"
+        data-wasm-opt-params="--enable-bulk-memory --enable-nontrapping-float-to-int" />
 </head>
 <body>
   <div id="loading">loading...</div>
-  <link data-trunk rel="rust" data-wasm-opt="-Oz" />
   <script>
     const observer = new MutationObserver(() => {
       if (document.querySelector('canvas')) {
@@ -42,7 +45,7 @@
         observer.disconnect();
       }
     });
-    observer.observe(document.body, { childList: true });
+    observer.observe(document.body, { childList: true, subtree: true });
   </script>
 </body>
 </html>
