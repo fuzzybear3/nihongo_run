@@ -14,8 +14,16 @@ fn measure_screen() -> (u32, u32) {
     #[cfg(target_arch = "wasm32")]
     {
         if let Some(win) = web_sys::window() {
-            let w = win.inner_width().ok().and_then(|v| v.as_f64()).unwrap_or(DEFAULT_WIDTH as f64) as u32;
-            let h = win.inner_height().ok().and_then(|v| v.as_f64()).unwrap_or(DEFAULT_HEIGHT as f64) as u32;
+            let w = win
+                .inner_width()
+                .ok()
+                .and_then(|v| v.as_f64())
+                .unwrap_or(DEFAULT_WIDTH as f64) as u32;
+            let h = win
+                .inner_height()
+                .ok()
+                .and_then(|v| v.as_f64())
+                .unwrap_or(DEFAULT_HEIGHT as f64) as u32;
             return (w.min(MAX_WEB_WIDTH), h.min(MAX_WEB_HEIGHT));
         }
     }
@@ -32,15 +40,15 @@ const CAM_LERP: f32 = 6.0;
 
 const TILE_LENGTH: f32 = 20.0;
 const TILE_WIDTH: f32 = 5.0;
-const TILES_AHEAD: i32 = 6;   // how many tiles to keep in front of the player
-const TILES_BEHIND: i32 = 3;  // how many tiles to keep behind the player
+const TILES_AHEAD: i32 = 6; // how many tiles to keep in front of the player
+const TILES_BEHIND: i32 = 3; // how many tiles to keep behind the player
 
 // ─── Components & Resources ───────────────────────────────────────────────────
 
 #[derive(Component)]
 struct Player {
-    lateral: f32,         // current left/right position
-    target_lateral: f32,  // where we're steering toward
+    lateral: f32,        // current left/right position
+    target_lateral: f32, // where we're steering toward
 }
 
 #[derive(Component)]
@@ -82,7 +90,10 @@ fn main() {
     App::new()
         .add_plugins(
             DefaultPlugins
-                .set(AssetPlugin { meta_check: AssetMetaCheck::Never, ..default() })
+                .set(AssetPlugin {
+                    meta_check: AssetMetaCheck::Never,
+                    ..default()
+                })
                 .set(WindowPlugin {
                     primary_window: Some(Window {
                         title: "Nihongo Run".into(),
@@ -97,7 +108,17 @@ fn main() {
         .insert_resource(ClearColor(Color::srgb(0.4, 0.65, 0.85)))
         .insert_resource(DragState::default())
         .add_systems(Startup, setup)
-        .add_systems(Update, (input_system, steer_system, move_system, camera_follow_system, manage_tiles_system).chain())
+        .add_systems(
+            Update,
+            (
+                input_system,
+                steer_system,
+                move_system,
+                camera_follow_system,
+                manage_tiles_system,
+            )
+                .chain(),
+        )
         .run();
 }
 
@@ -115,7 +136,11 @@ fn setup(
         ..default()
     });
     commands.spawn((
-        DirectionalLight { illuminance: 8_000.0, shadows_enabled: false, ..default() },
+        DirectionalLight {
+            illuminance: 8_000.0,
+            shadows_enabled: false,
+            ..default()
+        },
         Transform::from_rotation(Quat::from_euler(EulerRot::XYZ, -0.8, 0.3, 0.0)),
     ));
 
@@ -131,7 +156,11 @@ fn setup(
         perceptual_roughness: 0.9,
         ..default()
     });
-    commands.insert_resource(TileAssets { mesh: tile_mesh, mat_a, mat_b });
+    commands.insert_resource(TileAssets {
+        mesh: tile_mesh,
+        mat_a,
+        mat_b,
+    });
     commands.insert_resource(TileManager {
         frontier_z: TILE_LENGTH / 2.0,
         spawned: std::collections::VecDeque::new(),
@@ -146,7 +175,10 @@ fn setup(
             ..default()
         })),
         Transform::from_xyz(0.0, 0.9, 0.0),
-        Player { lateral: 0.0, target_lateral: 0.0 },
+        Player {
+            lateral: 0.0,
+            target_lateral: 0.0,
+        },
     ));
 
     // Camera
@@ -166,7 +198,9 @@ fn input_system(
     mut drag: ResMut<DragState>,
     window_q: Query<&Window, With<bevy::window::PrimaryWindow>>,
 ) {
-    let Ok(window) = window_q.single() else { return };
+    let Ok(window) = window_q.single() else {
+        return;
+    };
     let half_w = window.width() * 0.5;
     let mut touch_handled = false;
 
@@ -215,8 +249,12 @@ fn steer_system(
     window_q: Query<&Window, With<bevy::window::PrimaryWindow>>,
     mut player_q: Query<&mut Player>,
 ) {
-    let Ok(window) = window_q.single() else { return };
-    let Ok(mut player) = player_q.single_mut() else { return };
+    let Ok(window) = window_q.single() else {
+        return;
+    };
+    let Ok(mut player) = player_q.single_mut() else {
+        return;
+    };
 
     if drag.active {
         let delta = drag.current_x - drag.start_x;
@@ -228,10 +266,14 @@ fn steer_system(
 }
 
 fn move_system(time: Res<Time>, mut player_q: Query<(&mut Player, &mut Transform)>) {
-    let Ok((mut player, mut transform)) = player_q.single_mut() else { return };
+    let Ok((mut player, mut transform)) = player_q.single_mut() else {
+        return;
+    };
     let dt = time.delta_secs();
 
-    player.lateral = player.lateral.lerp(player.target_lateral, STEER_SMOOTHING * dt);
+    player.lateral = player
+        .lateral
+        .lerp(player.target_lateral, STEER_SMOOTHING * dt);
 
     transform.translation.z -= PLAYER_SPEED * dt;
     transform.translation.x = player.lateral;
@@ -242,8 +284,12 @@ fn camera_follow_system(
     player_q: Query<&Transform, (With<Player>, Without<CameraMarker>)>,
     mut cam_q: Query<&mut Transform, (With<CameraMarker>, Without<Player>)>,
 ) {
-    let Ok(player_t) = player_q.single() else { return };
-    let Ok(mut cam_t) = cam_q.single_mut() else { return };
+    let Ok(player_t) = player_q.single() else {
+        return;
+    };
+    let Ok(mut cam_t) = cam_q.single_mut() else {
+        return;
+    };
 
     let ideal = player_t.translation + CAM_OFFSET;
     cam_t.translation = cam_t.translation.lerp(ideal, CAM_LERP * time.delta_secs());
@@ -256,7 +302,9 @@ fn manage_tiles_system(
     assets: Res<TileAssets>,
     player_q: Query<&Transform, With<Player>>,
 ) {
-    let Ok(player_t) = player_q.single() else { return };
+    let Ok(player_t) = player_q.single() else {
+        return;
+    };
     let pz = player_t.translation.z;
 
     // Spawn tiles ahead until we have TILES_AHEAD tiles in front of the player.
@@ -268,12 +316,14 @@ fn manage_tiles_system(
         } else {
             assets.mat_b.clone()
         };
-        let entity = commands.spawn((
-            Tile,
-            Mesh3d(assets.mesh.clone()),
-            MeshMaterial3d(mat),
-            Transform::from_xyz(0.0, -0.15, center_z),
-        )).id();
+        let entity = commands
+            .spawn((
+                Tile,
+                Mesh3d(assets.mesh.clone()),
+                MeshMaterial3d(mat),
+                Transform::from_xyz(0.0, -0.15, center_z),
+            ))
+            .id();
         manager.spawned.push_back((center_z, entity));
         manager.frontier_z -= TILE_LENGTH;
         manager.count += 1;
