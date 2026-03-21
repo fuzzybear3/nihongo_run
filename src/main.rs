@@ -226,15 +226,17 @@ fn input_system(
 
     if !touch_handled {
         if mouse.just_pressed(MouseButton::Left)
-            && let Some(pos) = window.cursor_position() {
-                drag.active = true;
-                drag.start_x = pos.x - half_w;
-                drag.current_x = drag.start_x;
-            }
+            && let Some(pos) = window.cursor_position()
+        {
+            drag.active = true;
+            drag.start_x = pos.x - half_w;
+            drag.current_x = drag.start_x;
+        }
         if mouse.pressed(MouseButton::Left)
-            && let Some(pos) = window.cursor_position() {
-                drag.current_x = pos.x - half_w;
-            }
+            && let Some(pos) = window.cursor_position()
+        {
+            drag.current_x = pos.x - half_w;
+        }
         if mouse.just_released(MouseButton::Left) {
             drag.active = false;
         }
