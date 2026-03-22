@@ -1,12 +1,11 @@
 use bevy::{asset::AssetMetaCheck, prelude::*};
-use bevy::camera::{ImageRenderTarget, RenderTarget};
-use bevy::asset::RenderAssetUsages;
-use bevy::render::render_resource::{
-    Extent3d, TextureDimension, TextureFormat, TextureUsages,
-};
-use bevy::render::view::screenshot::{save_to_disk, Screenshot};
+use bevy::anti_alias::smaa::{Smaa, SmaaPreset};
+use bevy::render::alpha::AlphaMode;
 use bevy_egui::{EguiContexts, EguiPlugin, EguiPrimaryContextPass, egui};
+use bevy_rich_text3d::{LoadFonts, Text3d, Text3dPlugin, Text3dStyling, TextAtlas};
+use bevy::render::view::screenshot::{save_to_disk, Screenshot};
 use rand::{rngs::SmallRng, Rng, SeedableRng};
+use std::num::NonZero;
 
 // ─── Window constants ─────────────────────────────────────────────────────────
 
@@ -61,11 +60,7 @@ const TILES_BEHIND: i32 = 3;
 const GATE_SPACING: f32 = 80.0;
 const GATES_AHEAD: u32 = 2;
 
-// Sign texture resolution
-const SIGN_TEX_SIZE: u32 = 512;
-
 // ─── N5 vocabulary ────────────────────────────────────────────────────────────
-// (hiragana, english)
 const N5_WORDS: &[(&str, &str)] = &[
     ("みず",      "water"),
     ("ひ",        "fire"),
@@ -117,16 +112,11 @@ struct Tile;
 #[derive(Component)]
 struct Billboard;
 
-/// Marks the left or right answer sign on a decision gate.
 #[derive(Component)]
 enum GateSign {
     Left,
     Right,
 }
-
-/// Holds the offscreen UI camera entity so it can be despawned with the gate.
-#[derive(Component)]
-struct GateUiCamera(Entity);
 
 #[derive(Resource)]
 struct TileAssets {
@@ -156,26 +146,23 @@ struct DragState {
     touch_id: Option<u64>,
 }
 
+/// Shared material for all Text3d entities.
+#[derive(Resource)]
+struct TextMat(Handle<StandardMaterial>);
+
 #[derive(Resource)]
 struct Deck {
     rng: SmallRng,
 }
 
 impl Deck {
-    /// Returns (english_question, correct_japanese, distractor_japanese).
     fn pick(&mut self) -> (&'static str, &'static str, &'static str) {
         let q = self.rng.gen_range(0..N5_WORDS.len());
         let mut d = self.rng.gen_range(0..N5_WORDS.len() - 1);
-        if d >= q {
-            d += 1;
-        }
+        if d >= q { d += 1; }
         (N5_WORDS[q].1, N5_WORDS[q].0, N5_WORDS[d].0)
     }
 }
-
-/// Font handle loaded from assets.
-#[derive(Resource)]
-struct JpFont(Handle<Font>);
 
 // ─── Main ─────────────────────────────────────────────────────────────────────
 
@@ -199,6 +186,12 @@ fn main() {
                     ..default()
                 }),
         )
+        // Insert LoadFonts before the plugin so init_resource keeps our value
+        .insert_resource(LoadFonts {
+            font_embedded: vec![include_bytes!("../assets/fonts/TakaoPGothic.ttf")],
+            ..default()
+        })
+        .add_plugins(Text3dPlugin::default())
         .add_plugins(EguiPlugin::default())
         .insert_resource(ClearColor(Color::srgb(0.4, 0.65, 0.85)))
         .insert_resource(DragState::default())
@@ -218,11 +211,12 @@ fn main() {
                 manage_tiles_system,
                 manage_gates_system,
                 billboard_system,
+                screenshot_system,
+                auto_screenshot_system,
             )
                 .chain(),
         )
         .add_systems(EguiPrimaryContextPass, camera_settings_ui)
-        .add_systems(Update, screenshot_system)
         .run();
 }
 
@@ -232,12 +226,17 @@ fn setup(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
-    asset_server: Res<AssetServer>,
 ) {
+    // Shared material for all Text3d entities
+    let text_mat = materials.add(StandardMaterial {
+        base_color_texture: Some(TextAtlas::DEFAULT_IMAGE.clone()),
+        alpha_mode: AlphaMode::Mask(0.5),
+        unlit: true,
+        cull_mode: None,
+        ..default()
+    });
+    commands.insert_resource(TextMat(text_mat));
     commands.insert_resource(Deck { rng: SmallRng::seed_from_u64(42) });
-
-    let font: Handle<Font> = asset_server.load("fonts/TakaoPGothic.ttf");
-    commands.insert_resource(JpFont(font));
 
     // Lighting
     commands.insert_resource(GlobalAmbientLight {
@@ -284,10 +283,11 @@ fn setup(
         Player { lateral: 0.0, target_lateral: 0.0 },
     ));
 
-    // Main 3D camera
+    // Main 3D camera with SMAA
     commands.spawn((
         Camera3d::default(),
         Msaa::Off,
+        Smaa { preset: SmaaPreset::Medium },
         Transform::from_translation(CAM_OFFSET_DEFAULT).looking_at(Vec3::ZERO, Vec3::Y),
         CameraMarker,
     ));
@@ -300,81 +300,11 @@ fn setup(
 
 // ─── Gate spawning ────────────────────────────────────────────────────────────
 
-/// Creates an offscreen render target image, spawns a Camera2d targeting it,
-/// spawns a UI text node attached to that camera, and returns the image handle
-/// plus the camera entity (for later cleanup).
-fn make_sign_texture(
-    commands: &mut Commands,
-    images: &mut Assets<Image>,
-    font: Handle<Font>,
-    text: &str,
-    bg_color: Color,
-    text_color: Color,
-) -> (Handle<Image>, Entity) {
-    // 1. Create blank render-target image
-    let size = Extent3d {
-        width: SIGN_TEX_SIZE,
-        height: SIGN_TEX_SIZE,
-        depth_or_array_layers: 1,
-    };
-    let mut image = Image::new_fill(
-        size,
-        TextureDimension::D2,
-        &[0, 0, 0, 255],
-        TextureFormat::Bgra8UnormSrgb,
-        RenderAssetUsages::default(),
-    );
-    image.texture_descriptor.usage =
-        TextureUsages::TEXTURE_BINDING
-        | TextureUsages::COPY_DST
-        | TextureUsages::RENDER_ATTACHMENT;
-    let image_handle = images.add(image);
-
-    // 2. Spawn offscreen Camera2d targeting the image
-    let cam_entity = commands.spawn((
-        Camera2d,
-        Camera {
-            order: -1,
-            clear_color: ClearColorConfig::Custom(bg_color),
-            ..default()
-        },
-        RenderTarget::Image(ImageRenderTarget {
-            handle: image_handle.clone(),
-            scale_factor: 1.0,
-        }),
-    )).id();
-
-    // 3. Spawn UI text node attached to that camera
-    commands.spawn((
-        Node {
-            width: Val::Percent(100.0),
-            height: Val::Percent(100.0),
-            justify_content: JustifyContent::Center,
-            align_items: AlignItems::Center,
-            ..default()
-        },
-        bevy::ui::UiTargetCamera(cam_entity),
-    )).with_children(|parent| {
-        parent.spawn((
-            Text::new(text),
-            TextFont {
-                font,
-                font_size: 120.0,
-                ..default()
-            },
-            TextColor(text_color),
-        ));
-    });
-
-    (image_handle, cam_entity)
-}
-
 fn spawn_gate(
     commands: &mut Commands,
     meshes: &mut Assets<Mesh>,
     materials: &mut Assets<StandardMaterial>,
-    images: &mut Assets<Image>,
-    font: Handle<Font>,
+    text_mat: Handle<StandardMaterial>,
     gate_z: f32,
     question: &str,
     answer_l: &str,
@@ -382,7 +312,7 @@ fn spawn_gate(
 ) -> Vec<Entity> {
     let mut entities = Vec::new();
 
-    // ── Center post (torii vermillion) ──
+    // ── Center post ──
     entities.push(commands.spawn((
         Mesh3d(meshes.add(Cylinder::new(0.18, 4.8))),
         MeshMaterial3d(materials.add(StandardMaterial {
@@ -393,75 +323,87 @@ fn spawn_gate(
         Transform::from_xyz(0.0, 2.4, gate_z),
     )).id());
 
-    // ── Question crossbeam with text ──
-    let (q_img, q_cam) = make_sign_texture(
-        commands, images,
-        font.clone(),
-        &question.to_uppercase(),
-        Color::srgb(0.95, 0.90, 0.75),
-        Color::srgb(0.15, 0.08, 0.02),
-    );
-    let crossbeam = commands.spawn((
-        Mesh3d(meshes.add(Cuboid::new(5.0, 1.5, 0.15))),
+    // ── Question crossbeam (mesh + text) ──
+    entities.push(commands.spawn((
+        Mesh3d(meshes.add(Cuboid::new(5.0, 1.5, 0.12))),
         MeshMaterial3d(materials.add(StandardMaterial {
-            base_color_texture: Some(q_img),
-            base_color: Color::WHITE,
-            unlit: true,
-            uv_transform: StandardMaterial::FLIP_VERTICAL,
+            base_color: Color::srgb(0.95, 0.90, 0.75),
+            perceptual_roughness: 0.6,
             ..default()
         })),
         Transform::from_xyz(0.0, 5.8, gate_z),
         Billboard,
-        GateUiCamera(q_cam),
-    )).id();
-    entities.push(crossbeam);
+    )).id());
+    entities.push(commands.spawn((
+        Text3d::new(question.to_uppercase()),
+        Text3dStyling {
+            size: 72.0,
+            color: Srgba::new(0.12, 0.06, 0.01, 1.0),
+            stroke: NonZero::new(4),
+            stroke_color: Srgba::new(1.0, 0.95, 0.8, 1.0),
+            world_scale: Some(Vec2::splat(0.6)),
+            ..default()
+        },
+        Mesh3d::default(),
+        MeshMaterial3d(text_mat.clone()),
+        Transform::from_xyz(0.0, 5.8, gate_z + 0.1),
+        Billboard,
+    )).id());
 
-    let sign_mesh = meshes.add(Cuboid::new(2.2, 2.5, 0.12));
+    let sign_mesh = meshes.add(Cuboid::new(3.0, 2.5, 0.12));
 
-    // ── Left sign — warm gold ──
-    let (l_img, l_cam) = make_sign_texture(
-        commands, images,
-        font.clone(),
-        answer_l,
-        Color::srgb(0.9, 0.72, 0.08),
-        Color::srgb(0.08, 0.04, 0.0),
-    );
+    // ── Left sign — gold background + hiragana ──
     entities.push(commands.spawn((
         Mesh3d(sign_mesh.clone()),
         MeshMaterial3d(materials.add(StandardMaterial {
-            base_color_texture: Some(l_img),
-            base_color: Color::WHITE,
-            unlit: true,
-            uv_transform: StandardMaterial::FLIP_VERTICAL,
+            base_color: Color::srgb(0.9, 0.72, 0.08),
+            perceptual_roughness: 0.4,
             ..default()
         })),
         Transform::from_xyz(-1.8, 3.2, gate_z),
         Billboard,
         GateSign::Left,
-        GateUiCamera(l_cam),
+    )).id());
+    entities.push(commands.spawn((
+        Text3d::new(answer_l),
+        Text3dStyling {
+            size: 96.0,
+            color: Srgba::new(0.08, 0.04, 0.0, 1.0),
+            stroke: NonZero::new(5),
+            stroke_color: Srgba::new(1.0, 0.88, 0.4, 1.0),
+            world_scale: Some(Vec2::splat(1.0)),
+            ..default()
+        },
+        Mesh3d::default(),
+        MeshMaterial3d(text_mat.clone()),
+        Transform::from_xyz(-1.8, 3.2, gate_z + 0.1),
+        Billboard,
     )).id());
 
-    // ── Right sign — cool blue ──
-    let (r_img, r_cam) = make_sign_texture(
-        commands, images,
-        font.clone(),
-        answer_r,
-        Color::srgb(0.1, 0.4, 0.85),
-        Color::WHITE,
-    );
+    // ── Right sign — blue background + hiragana ──
     entities.push(commands.spawn((
         Mesh3d(sign_mesh),
         MeshMaterial3d(materials.add(StandardMaterial {
-            base_color_texture: Some(r_img),
-            base_color: Color::WHITE,
-            unlit: true,
-            uv_transform: StandardMaterial::FLIP_VERTICAL,
+            base_color: Color::srgb(0.1, 0.4, 0.85),
+            perceptual_roughness: 0.4,
             ..default()
         })),
         Transform::from_xyz(1.8, 3.2, gate_z),
         Billboard,
         GateSign::Right,
-        GateUiCamera(r_cam),
+    )).id());
+    entities.push(commands.spawn((
+        Text3d::new(answer_r),
+        Text3dStyling {
+            size: 96.0,
+            color: Srgba::new(0.05, 0.05, 0.1, 1.0),
+            world_scale: Some(Vec2::splat(1.0)),
+            ..default()
+        },
+        Mesh3d::default(),
+        MeshMaterial3d(text_mat.clone()),
+        Transform::from_xyz(1.8, 3.2, gate_z + 0.1),
+        Billboard,
     )).id());
 
     entities
@@ -615,12 +557,10 @@ fn manage_gates_system(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
-    mut images: ResMut<Assets<Image>>,
     mut manager: ResMut<GateManager>,
     mut deck: ResMut<Deck>,
-    font: Res<JpFont>,
+    text_mat: Res<TextMat>,
     player_q: Query<&Transform, With<Player>>,
-    ui_cam_q: Query<&GateUiCamera>,
 ) {
     let Ok(player_t) = player_q.single() else { return };
     let pz = player_t.translation.z;
@@ -634,8 +574,8 @@ fn manage_gates_system(
             (distractor, correct)
         };
         let entities = spawn_gate(
-            &mut commands, &mut meshes, &mut materials, &mut images,
-            font.0.clone(), z, question, answer_l, answer_r,
+            &mut commands, &mut meshes, &mut materials,
+            text_mat.0.clone(), z, question, answer_l, answer_r,
         );
         manager.live.push_back((z, entities));
         manager.next_z -= GATE_SPACING;
@@ -644,11 +584,6 @@ fn manage_gates_system(
     while let Some((gate_z, entities)) = manager.live.front() {
         if *gate_z > pz + GATE_SPACING {
             for &e in entities {
-                // Also despawn the offscreen UI camera attached to this mesh
-                if let Ok(ui_cam) = ui_cam_q.get(e) {
-                    commands.entity(ui_cam.0).despawn_related::<Children>();
-                    commands.entity(ui_cam.0).despawn();
-                }
                 commands.entity(e).despawn();
             }
             manager.live.pop_front();
@@ -677,5 +612,15 @@ fn screenshot_system(mut commands: Commands, keys: Res<ButtonInput<KeyCode>>) {
             .spawn(Screenshot::primary_window())
             .observe(save_to_disk(path));
         info!("Screenshot saved to {path}");
+    }
+}
+
+fn auto_screenshot_system(mut commands: Commands, mut frame: Local<u32>) {
+    *frame += 1;
+    if *frame == 30 {
+        commands
+            .spawn(Screenshot::primary_window())
+            .observe(save_to_disk("/tmp/nihongo_screenshot.png"));
+        info!("Auto-screenshot taken (frame 30)");
     }
 }
