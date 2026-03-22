@@ -4,6 +4,7 @@ use bevy::asset::RenderAssetUsages;
 use bevy::render::render_resource::{
     Extent3d, TextureDimension, TextureFormat, TextureUsages,
 };
+use bevy::render::view::screenshot::{save_to_disk, Screenshot};
 use bevy_egui::{EguiContexts, EguiPlugin, EguiPrimaryContextPass, egui};
 use rand::{rngs::SmallRng, Rng, SeedableRng};
 
@@ -221,6 +222,7 @@ fn main() {
                 .chain(),
         )
         .add_systems(EguiPrimaryContextPass, camera_settings_ui)
+        .add_systems(Update, screenshot_system)
         .run();
 }
 
@@ -405,6 +407,7 @@ fn spawn_gate(
             base_color_texture: Some(q_img),
             base_color: Color::WHITE,
             unlit: true,
+            uv_transform: StandardMaterial::FLIP_VERTICAL,
             ..default()
         })),
         Transform::from_xyz(0.0, 5.8, gate_z),
@@ -429,6 +432,7 @@ fn spawn_gate(
             base_color_texture: Some(l_img),
             base_color: Color::WHITE,
             unlit: true,
+            uv_transform: StandardMaterial::FLIP_VERTICAL,
             ..default()
         })),
         Transform::from_xyz(-1.8, 3.2, gate_z),
@@ -451,6 +455,7 @@ fn spawn_gate(
             base_color_texture: Some(r_img),
             base_color: Color::WHITE,
             unlit: true,
+            uv_transform: StandardMaterial::FLIP_VERTICAL,
             ..default()
         })),
         Transform::from_xyz(1.8, 3.2, gate_z),
@@ -662,5 +667,15 @@ fn billboard_system(
         let to_cam = cam_t.translation - transform.translation;
         let yaw = f32::atan2(to_cam.x, to_cam.z);
         transform.rotation = Quat::from_rotation_y(yaw);
+    }
+}
+
+fn screenshot_system(mut commands: Commands, keys: Res<ButtonInput<KeyCode>>) {
+    if keys.just_pressed(KeyCode::F12) {
+        let path = "/tmp/nihongo_screenshot.png";
+        commands
+            .spawn(Screenshot::primary_window())
+            .observe(save_to_disk(path));
+        info!("Screenshot saved to {path}");
     }
 }
