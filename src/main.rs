@@ -5,6 +5,7 @@ use bevy_egui::{EguiContexts, EguiPlugin, EguiPrimaryContextPass, egui};
 use bevy_rich_text3d::{LoadFonts, Text3d, Text3dPlugin, Text3dStyling, TextAtlas};
 use bevy::render::view::screenshot::{save_to_disk, Screenshot};
 use rand::{rngs::SmallRng, Rng, SeedableRng};
+use std::collections::VecDeque;
 use std::num::NonZero;
 
 // ─── Window constants ─────────────────────────────────────────────────────────
@@ -61,6 +62,9 @@ const TILES_BEHIND: i32 = 3;
 
 const GATE_SPACING: f32 = 50.0;
 const GATES_AHEAD: u32 = 4;
+const SIGN_X_OFFSET: f32 = 1.8;
+const SIGN_SLIDE_TARGET: f32 = 10.0;
+const SIGN_SLIDE_SPEED: f32 = 3.5;
 
 // ─── N5 vocabulary ────────────────────────────────────────────────────────────
 const N5_WORDS: &[(&str, &str)] = &[
@@ -115,12 +119,6 @@ struct Tile;
 #[derive(Component)]
 struct Billboard;
 
-#[derive(Component)]
-enum GateSign {
-    Left,
-    Right,
-}
-
 /// Slides the sign outward along X once the player passes gate_z.
 #[derive(Component)]
 struct SignSlide {
@@ -152,14 +150,14 @@ struct TileAssets {
 #[derive(Resource)]
 struct TileManager {
     frontier_z: f32,
-    spawned: std::collections::VecDeque<(f32, Entity)>,
+    spawned: VecDeque<(f32, Entity)>,
     count: u32,
 }
 
 #[derive(Resource)]
 struct GateManager {
     next_z: f32,
-    live: std::collections::VecDeque<(f32, Vec<Entity>)>,
+    live: VecDeque<(f32, Vec<Entity>)>,
 }
 
 #[derive(Resource, Default)]
@@ -167,7 +165,6 @@ struct DragState {
     active: bool,
     start_x: f32,
     current_x: f32,
-    start_y: f32,
     current_y: f32,
     prev_y: f32,
     base_lateral: f32, // lateral offset at the moment the drag origin was set
@@ -247,7 +244,7 @@ fn main() {
             )
                 .chain(),
         )
-        .add_systems(EguiPrimaryContextPass, camera_settings_ui);
+        .add_systems(EguiPrimaryContextPass, (camera_settings_ui, flash_overlay_ui));
 
     #[cfg(not(target_arch = "wasm32"))]
     if std::env::args().any(|a| a == "--screenshot") {
@@ -392,52 +389,39 @@ fn spawn_gate(
     )).id());
 
     let sign_mesh = meshes.add(Cuboid::new(3.0, 2.5, 0.12));
+    let [l0, l1] = spawn_sign(commands, &sign_mesh, materials, text_mat.clone(),
+        gate_z, -SIGN_X_OFFSET, Color::srgb(0.9, 0.72, 0.08), answer_l);
+    let [r0, r1] = spawn_sign(commands, &sign_mesh, materials, text_mat,
+        gate_z,  SIGN_X_OFFSET, Color::srgb(0.1, 0.40, 0.85), answer_r);
+    entities.extend([l0, l1, r0, r1]);
 
-    // ── Left sign — gold background + hiragana ──
-    entities.push(commands.spawn((
+    entities
+}
+
+fn spawn_sign(
+    commands: &mut Commands,
+    sign_mesh: &Handle<Mesh>,
+    materials: &mut Assets<StandardMaterial>,
+    text_mat: Handle<StandardMaterial>,
+    gate_z: f32,
+    x: f32,
+    bg_color: Color,
+    text: &str,
+) -> [Entity; 2] {
+    let dir = x.signum();
+    let bg = commands.spawn((
         Mesh3d(sign_mesh.clone()),
         MeshMaterial3d(materials.add(StandardMaterial {
-            base_color: Color::srgb(0.9, 0.72, 0.08),
+            base_color: bg_color,
             perceptual_roughness: 0.4,
             ..default()
         })),
-        Transform::from_xyz(-1.8, 3.2, gate_z),
+        Transform::from_xyz(x, 3.2, gate_z),
         Billboard,
-        GateSign::Left,
-        SignSlide { gate_z, dir: -1.0 },
-    )).id());
-    entities.push(commands.spawn((
-        Text3d::new(answer_l),
-        Text3dStyling {
-            size: 96.0,
-            color: Srgba::new(0.08, 0.04, 0.0, 1.0),
-            stroke: NonZero::new(5),
-            stroke_color: Srgba::new(1.0, 0.88, 0.4, 1.0),
-            world_scale: Some(Vec2::splat(1.0)),
-            ..default()
-        },
-        Mesh3d::default(),
-        MeshMaterial3d(text_mat.clone()),
-        Transform::from_xyz(-1.8, 3.2, gate_z + 0.1),
-        Billboard,
-        SignSlide { gate_z, dir: -1.0 },
-    )).id());
-
-    // ── Right sign — blue background + hiragana ──
-    entities.push(commands.spawn((
-        Mesh3d(sign_mesh),
-        MeshMaterial3d(materials.add(StandardMaterial {
-            base_color: Color::srgb(0.1, 0.4, 0.85),
-            perceptual_roughness: 0.4,
-            ..default()
-        })),
-        Transform::from_xyz(1.8, 3.2, gate_z),
-        Billboard,
-        GateSign::Right,
-        SignSlide { gate_z, dir: 1.0 },
-    )).id());
-    entities.push(commands.spawn((
-        Text3d::new(answer_r),
+        SignSlide { gate_z, dir },
+    )).id();
+    let label = commands.spawn((
+        Text3d::new(text),
         Text3dStyling {
             size: 96.0,
             color: Srgba::new(0.05, 0.05, 0.1, 1.0),
@@ -445,13 +429,12 @@ fn spawn_gate(
             ..default()
         },
         Mesh3d::default(),
-        MeshMaterial3d(text_mat.clone()),
-        Transform::from_xyz(1.8, 3.2, gate_z + 0.1),
+        MeshMaterial3d(text_mat),
+        Transform::from_xyz(x, 3.2, gate_z + 0.1),
         Billboard,
-        SignSlide { gate_z, dir: 1.0 },
-    )).id());
-
-    entities
+        SignSlide { gate_z, dir },
+    )).id();
+    [bg, label]
 }
 
 // ─── Systems ──────────────────────────────────────────────────────────────────
@@ -475,9 +458,8 @@ fn input_system(
         drag.active = true;
         drag.start_x = touch.position().x - half_w;
         drag.current_x = drag.start_x;
-        drag.start_y = touch.position().y;
-        drag.current_y = drag.start_y;
-        drag.prev_y = drag.start_y;
+        drag.current_y = touch.position().y;
+        drag.prev_y = drag.current_y;
         drag.base_lateral = 0.0;
         drag.dashed = false;
         drag.touch_id = Some(touch.id());
@@ -506,9 +488,8 @@ fn input_system(
             drag.active = true;
             drag.start_x = pos.x - half_w;
             drag.current_x = drag.start_x;
-            drag.start_y = pos.y;
-            drag.current_y = drag.start_y;
-            drag.prev_y = drag.start_y;
+            drag.current_y = pos.y;
+            drag.prev_y = drag.current_y;
             drag.base_lateral = 0.0;
             drag.dashed = false;
         }
@@ -528,7 +509,6 @@ fn input_system(
     // Allow re-swiping once the previous dash has finished
     if player.dash_until_z == f32::INFINITY && drag.dashed {
         drag.dashed = false;
-        drag.start_y = drag.current_y;
         drag.start_x = drag.current_x;
         drag.base_lateral = player.lateral; // hold lane: delta=0 maps to current position
     }
@@ -600,7 +580,6 @@ fn camera_follow_system(
 fn camera_settings_ui(
     mut contexts: EguiContexts,
     mut settings: ResMut<CameraSettings>,
-    flash: Res<FlashState>,
 ) -> Result {
     egui::Window::new("Camera")
         .default_open(false)
@@ -609,7 +588,10 @@ fn camera_settings_ui(
             ui.add(egui::Slider::new(&mut settings.distance, 1.0..=30.0).text("distance"));
             ui.add(egui::Slider::new(&mut settings.lerp, 0.5..=20.0).text("lerp speed"));
         });
+    Ok(())
+}
 
+fn flash_overlay_ui(mut contexts: EguiContexts, flash: Res<FlashState>) -> Result {
     if flash.timer > 0.0 && !flash.correct {
         let alpha = (flash.timer * 2.5).min(1.0) * 0.35;
         let color = egui::Color32::from_rgba_unmultiplied(220, 40, 40, (alpha * 255.0) as u8);
@@ -622,7 +604,6 @@ fn camera_settings_ui(
                 ui.painter().rect_filled(screen, 0.0, color);
             });
     }
-
     Ok(())
 }
 
@@ -761,9 +742,9 @@ fn slide_signs_system(
     let pz = player_t.translation.z;
     for (slide, mut transform) in sign_q.iter_mut() {
         if pz < slide.gate_z {
-            let target_x = slide.dir * 10.0;
+            let target_x = slide.dir * SIGN_SLIDE_TARGET;
             transform.translation.x =
-                transform.translation.x.lerp(target_x, 3.5 * time.delta_secs());
+                transform.translation.x.lerp(target_x, SIGN_SLIDE_SPEED * time.delta_secs());
         }
     }
 }
