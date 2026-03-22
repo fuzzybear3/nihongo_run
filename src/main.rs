@@ -106,7 +106,7 @@ const N5_WORDS: &[(&str, &str)] = &[
 struct Player {
     lateral: f32,
     target_lateral: f32,
-    dash_until_z: f32, // f32::INFINITY = not dashing
+    dashing: bool,
 }
 
 #[derive(Component)]
@@ -124,6 +124,12 @@ struct Billboard;
 struct SignSlide {
     gate_z: f32,
     dir: f32, // -1.0 = left, +1.0 = right
+}
+
+/// Drops the post downward after the player passes.
+#[derive(Component)]
+struct PostDrop {
+    gate_z: f32,
 }
 
 /// Marks the center post — tracks which side is correct.
@@ -167,8 +173,9 @@ struct DragState {
     current_x: f32,
     current_y: f32,
     prev_y: f32,
-    base_lateral: f32, // lateral offset at the moment the drag origin was set
-    dashed: bool,      // prevents re-triggering in the same gesture
+    base_lateral: f32,    // lateral offset at the moment the drag origin was set
+    dash_triggered: bool, // swipe-up consumed for this gesture; cleared when dash resolves
+    flick_dash: bool,     // finger released during dash — snap to center when gate passes
     touch_id: Option<u64>,
 }
 
@@ -239,6 +246,7 @@ fn main() {
                 gate_check_system,
                 billboard_system,
                 slide_signs_system,
+                drop_posts_system,
                 #[cfg(not(target_arch = "wasm32"))]
                 screenshot_system,
             )
@@ -315,7 +323,7 @@ fn setup(
             ..default()
         })),
         Transform::from_xyz(0.0, 0.9, 0.0),
-        Player { lateral: 0.0, target_lateral: 0.0, dash_until_z: f32::INFINITY },
+        Player { lateral: 0.0, target_lateral: 0.0, dashing: false },
     ));
 
     // Main 3D camera with SMAA
@@ -359,6 +367,7 @@ fn spawn_gate(
         })),
         Transform::from_xyz(0.0, 2.4, gate_z),
         GatePost { gate_z, correct_side, passed: false },
+        PostDrop { gate_z },
     )).id());
 
     // ── Question crossbeam (mesh + text) ──
@@ -444,12 +453,11 @@ fn input_system(
     touches: Res<Touches>,
     mouse: Res<ButtonInput<MouseButton>>,
     mut drag: ResMut<DragState>,
-    mut player_q: Query<(&Transform, &mut Player)>,
-    gate_manager: Res<GateManager>,
+    mut player_q: Query<&mut Player>,
     window_q: Query<&Window, With<bevy::window::PrimaryWindow>>,
 ) {
     let Ok(window) = window_q.single() else { return };
-    let Ok((player_t, mut player)) = player_q.single_mut() else { return };
+    let Ok(mut player) = player_q.single_mut() else { return };
     let half_w = window.width() * 0.5;
     let mut touch_handled = false;
 
@@ -460,8 +468,7 @@ fn input_system(
         drag.current_x = drag.start_x;
         drag.current_y = touch.position().y;
         drag.prev_y = drag.current_y;
-        drag.base_lateral = 0.0;
-        drag.dashed = false;
+        drag.base_lateral = player.lateral;
         drag.touch_id = Some(touch.id());
     }
     for touch in touches.iter() {
@@ -476,7 +483,8 @@ fn input_system(
         if drag.touch_id == Some(touch.id()) {
             touch_handled = true;
             drag.active = false;
-            drag.dashed = false;
+            if drag.dash_triggered { drag.flick_dash = true; }
+            drag.dash_triggered = false;
             drag.touch_id = None;
         }
     }
@@ -490,8 +498,7 @@ fn input_system(
             drag.current_x = drag.start_x;
             drag.current_y = pos.y;
             drag.prev_y = drag.current_y;
-            drag.base_lateral = 0.0;
-            drag.dashed = false;
+            drag.base_lateral = player.lateral;
         }
         if mouse.pressed(MouseButton::Left)
             && let Some(pos) = window.cursor_position()
@@ -502,34 +509,29 @@ fn input_system(
         }
         if mouse.just_released(MouseButton::Left) {
             drag.active = false;
-            drag.dashed = false;
+            if drag.dash_triggered { drag.flick_dash = true; }
+            drag.dash_triggered = false;
         }
     }
 
-    // Allow re-swiping once the previous dash has finished
-    if player.dash_until_z == f32::INFINITY && drag.dashed {
-        drag.dashed = false;
+    // Hold dash ended: hold lane and allow re-swiping
+    if !player.dashing && drag.dash_triggered {
+        drag.dash_triggered = false;
         drag.start_x = drag.current_x;
-        drag.base_lateral = player.lateral; // hold lane: delta=0 maps to current position
+        drag.base_lateral = player.lateral;
+    // Flick dash ended: snap to center
+    } else if !player.dashing && drag.flick_dash {
+        drag.flick_dash = false;
+        player.target_lateral = 0.0;
     }
 
     // Swipe-up detection: upward velocity exceeds threshold
-    if drag.active && !drag.dashed {
+    if drag.active && !drag.dash_triggered {
         let dt = time.delta_secs().max(0.001);
         let vel_y = (drag.prev_y - drag.current_y) / dt; // positive = upward
         if vel_y > SWIPE_UP_VELOCITY {
-            drag.dashed = true;
-            // Dash to the nearest gate ahead of the player
-            let pz = player_t.translation.z;
-            let target_z = gate_manager.live.iter()
-                .map(|(z, _)| *z)
-                .filter(|&z| z < pz)
-                .fold(f32::NEG_INFINITY, f32::max);
-            player.dash_until_z = if target_z == f32::NEG_INFINITY {
-                gate_manager.next_z // fallback: sprint to next unspawned gate
-            } else {
-                target_z
-            };
+            drag.dash_triggered = true;
+            player.dashing = true;
         }
     }
 }
@@ -554,11 +556,7 @@ fn move_system(time: Res<Time>, mut player_q: Query<(&mut Player, &mut Transform
     let Ok((mut player, mut transform)) = player_q.single_mut() else { return };
     let dt = time.delta_secs();
     player.lateral = player.lateral.lerp(player.target_lateral, STEER_SMOOTHING * dt);
-    let dashing = transform.translation.z > player.dash_until_z;
-    if !dashing {
-        player.dash_until_z = f32::INFINITY;
-    }
-    let speed = if dashing { PLAYER_SPEED * DASH_SPEED_MULT } else { PLAYER_SPEED };
+    let speed = if player.dashing { PLAYER_SPEED * DASH_SPEED_MULT } else { PLAYER_SPEED };
     transform.translation.z -= speed * dt;
     transform.translation.x = player.lateral;
 }
@@ -712,16 +710,17 @@ fn screenshot_system(mut commands: Commands, keys: Res<ButtonInput<KeyCode>>) {
 
 fn gate_check_system(
     time: Res<Time>,
-    player_q: Query<(&Transform, &Player)>,
+    mut player_q: Query<(&Transform, &mut Player)>,
     mut post_q: Query<&mut GatePost>,
     mut flash: ResMut<FlashState>,
 ) {
-    let Ok((player_t, player)) = player_q.single() else { return };
+    let Ok((player_t, mut player)) = player_q.single_mut() else { return };
     let pz = player_t.translation.z;
 
     for mut post in post_q.iter_mut() {
         if !post.passed && pz < post.gate_z - 0.5 {
             post.passed = true;
+            player.dashing = false;
             let player_side = if player.lateral <= 0.0 { -1.0 } else { 1.0 };
             flash.correct = player_side == post.correct_side;
             flash.timer = 0.6;
@@ -745,6 +744,21 @@ fn slide_signs_system(
             let target_x = slide.dir * SIGN_SLIDE_TARGET;
             transform.translation.x =
                 transform.translation.x.lerp(target_x, SIGN_SLIDE_SPEED * time.delta_secs());
+        }
+    }
+}
+
+fn drop_posts_system(
+    time: Res<Time>,
+    player_q: Query<&Transform, With<Player>>,
+    mut post_q: Query<(&PostDrop, &mut Transform), Without<Player>>,
+) {
+    let Ok(player_t) = player_q.single() else { return };
+    let pz = player_t.translation.z;
+    for (post, mut transform) in post_q.iter_mut() {
+        if pz < post.gate_z {
+            transform.translation.y =
+                transform.translation.y.lerp(-5.0, SIGN_SLIDE_SPEED * time.delta_secs());
         }
     }
 }
