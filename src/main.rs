@@ -42,6 +42,8 @@ fn measure_screen() -> (u32, u32) {
 const PLAYER_SPEED: f32 = 10.0;
 const STEER_SMOOTHING: f32 = 8.0;
 const MAX_LATERAL: f32 = 2.0;
+const DASH_SPEED_MULT: f32 = 4.0;
+const SWIPE_UP_VELOCITY: f32 = 800.0; // pixels per second upward
 const CAM_OFFSET_DEFAULT: Vec3 = Vec3::new(0.0, 2.5, 12.0);
 const CAM_LERP_DEFAULT: f32 = 6.0;
 
@@ -57,8 +59,8 @@ const TILE_WIDTH: f32 = 5.0;
 const TILES_AHEAD: i32 = 6;
 const TILES_BEHIND: i32 = 3;
 
-const GATE_SPACING: f32 = 80.0;
-const GATES_AHEAD: u32 = 2;
+const GATE_SPACING: f32 = 50.0;
+const GATES_AHEAD: u32 = 4;
 
 // ─── N5 vocabulary ────────────────────────────────────────────────────────────
 const N5_WORDS: &[(&str, &str)] = &[
@@ -100,6 +102,7 @@ const N5_WORDS: &[(&str, &str)] = &[
 struct Player {
     lateral: f32,
     target_lateral: f32,
+    dash_until_z: f32, // f32::INFINITY = not dashing
 }
 
 #[derive(Component)]
@@ -116,6 +119,27 @@ struct Billboard;
 enum GateSign {
     Left,
     Right,
+}
+
+/// Slides the sign outward along X once the player passes gate_z.
+#[derive(Component)]
+struct SignSlide {
+    gate_z: f32,
+    dir: f32, // -1.0 = left, +1.0 = right
+}
+
+/// Marks the center post — tracks which side is correct.
+#[derive(Component)]
+struct GatePost {
+    gate_z: f32,
+    correct_side: f32, // -1.0 = left correct, +1.0 = right correct
+    passed: bool,
+}
+
+#[derive(Resource, Default)]
+struct FlashState {
+    timer: f32,
+    correct: bool,
 }
 
 #[derive(Resource)]
@@ -143,6 +167,10 @@ struct DragState {
     active: bool,
     start_x: f32,
     current_x: f32,
+    start_y: f32,
+    current_y: f32,
+    prev_y: f32,
+    dashed: bool, // prevents re-triggering in the same gesture
     touch_id: Option<u64>,
 }
 
@@ -210,7 +238,9 @@ fn main() {
                 camera_follow_system,
                 manage_tiles_system,
                 manage_gates_system,
+                gate_check_system,
                 billboard_system,
+                slide_signs_system,
                 screenshot_system,
                 auto_screenshot_system,
             )
@@ -237,6 +267,7 @@ fn setup(
     });
     commands.insert_resource(TextMat(text_mat));
     commands.insert_resource(Deck { rng: SmallRng::seed_from_u64(42) });
+    commands.insert_resource(FlashState::default());
 
     // Lighting
     commands.insert_resource(GlobalAmbientLight {
@@ -280,7 +311,7 @@ fn setup(
             ..default()
         })),
         Transform::from_xyz(0.0, 0.9, 0.0),
-        Player { lateral: 0.0, target_lateral: 0.0 },
+        Player { lateral: 0.0, target_lateral: 0.0, dash_until_z: f32::INFINITY },
     ));
 
     // Main 3D camera with SMAA
@@ -309,8 +340,10 @@ fn spawn_gate(
     question: &str,
     answer_l: &str,
     answer_r: &str,
+    correct_is_left: bool,
 ) -> Vec<Entity> {
     let mut entities = Vec::new();
+    let correct_side = if correct_is_left { -1.0 } else { 1.0 };
 
     // ── Center post ──
     entities.push(commands.spawn((
@@ -321,6 +354,7 @@ fn spawn_gate(
             ..default()
         })),
         Transform::from_xyz(0.0, 2.4, gate_z),
+        GatePost { gate_z, correct_side, passed: false },
     )).id());
 
     // ── Question crossbeam (mesh + text) ──
@@ -363,6 +397,7 @@ fn spawn_gate(
         Transform::from_xyz(-1.8, 3.2, gate_z),
         Billboard,
         GateSign::Left,
+        SignSlide { gate_z, dir: -1.0 },
     )).id());
     entities.push(commands.spawn((
         Text3d::new(answer_l),
@@ -378,6 +413,7 @@ fn spawn_gate(
         MeshMaterial3d(text_mat.clone()),
         Transform::from_xyz(-1.8, 3.2, gate_z + 0.1),
         Billboard,
+        SignSlide { gate_z, dir: -1.0 },
     )).id());
 
     // ── Right sign — blue background + hiragana ──
@@ -391,6 +427,7 @@ fn spawn_gate(
         Transform::from_xyz(1.8, 3.2, gate_z),
         Billboard,
         GateSign::Right,
+        SignSlide { gate_z, dir: 1.0 },
     )).id());
     entities.push(commands.spawn((
         Text3d::new(answer_r),
@@ -404,6 +441,7 @@ fn spawn_gate(
         MeshMaterial3d(text_mat.clone()),
         Transform::from_xyz(1.8, 3.2, gate_z + 0.1),
         Billboard,
+        SignSlide { gate_z, dir: 1.0 },
     )).id());
 
     entities
@@ -412,12 +450,16 @@ fn spawn_gate(
 // ─── Systems ──────────────────────────────────────────────────────────────────
 
 fn input_system(
+    time: Res<Time>,
     touches: Res<Touches>,
     mouse: Res<ButtonInput<MouseButton>>,
     mut drag: ResMut<DragState>,
+    mut player_q: Query<(&Transform, &mut Player)>,
+    gate_manager: Res<GateManager>,
     window_q: Query<&Window, With<bevy::window::PrimaryWindow>>,
 ) {
     let Ok(window) = window_q.single() else { return };
+    let Ok((player_t, mut player)) = player_q.single_mut() else { return };
     let half_w = window.width() * 0.5;
     let mut touch_handled = false;
 
@@ -426,18 +468,25 @@ fn input_system(
         drag.active = true;
         drag.start_x = touch.position().x - half_w;
         drag.current_x = drag.start_x;
+        drag.start_y = touch.position().y;
+        drag.current_y = drag.start_y;
+        drag.prev_y = drag.start_y;
+        drag.dashed = false;
         drag.touch_id = Some(touch.id());
     }
     for touch in touches.iter() {
         if drag.touch_id == Some(touch.id()) {
             touch_handled = true;
+            drag.prev_y = drag.current_y;
             drag.current_x = touch.position().x - half_w;
+            drag.current_y = touch.position().y;
         }
     }
     for touch in touches.iter_just_released() {
         if drag.touch_id == Some(touch.id()) {
             touch_handled = true;
             drag.active = false;
+            drag.dashed = false;
             drag.touch_id = None;
         }
     }
@@ -449,14 +498,48 @@ fn input_system(
             drag.active = true;
             drag.start_x = pos.x - half_w;
             drag.current_x = drag.start_x;
+            drag.start_y = pos.y;
+            drag.current_y = drag.start_y;
+            drag.prev_y = drag.start_y;
+            drag.dashed = false;
         }
         if mouse.pressed(MouseButton::Left)
             && let Some(pos) = window.cursor_position()
         {
+            drag.prev_y = drag.current_y;
             drag.current_x = pos.x - half_w;
+            drag.current_y = pos.y;
         }
         if mouse.just_released(MouseButton::Left) {
             drag.active = false;
+            drag.dashed = false;
+        }
+    }
+
+    // Allow re-swiping once the previous dash has finished
+    if player.dash_until_z == f32::INFINITY && drag.dashed {
+        drag.dashed = false;
+        drag.start_y = drag.current_y; // reset origin so next swipe is measured fresh
+        drag.start_x = drag.current_x;
+    }
+
+    // Swipe-up detection: upward velocity exceeds threshold
+    if drag.active && !drag.dashed {
+        let dt = time.delta_secs().max(0.001);
+        let vel_y = (drag.prev_y - drag.current_y) / dt; // positive = upward
+        if vel_y > SWIPE_UP_VELOCITY {
+            drag.dashed = true;
+            // Dash to the nearest gate ahead of the player
+            let pz = player_t.translation.z;
+            let target_z = gate_manager.live.iter()
+                .map(|(z, _)| *z)
+                .filter(|&z| z < pz)
+                .fold(f32::NEG_INFINITY, f32::max);
+            player.dash_until_z = if target_z == f32::NEG_INFINITY {
+                gate_manager.next_z // fallback: sprint to next unspawned gate
+            } else {
+                target_z
+            };
         }
     }
 }
@@ -482,7 +565,12 @@ fn move_system(time: Res<Time>, mut player_q: Query<(&mut Player, &mut Transform
     let Ok((mut player, mut transform)) = player_q.single_mut() else { return };
     let dt = time.delta_secs();
     player.lateral = player.lateral.lerp(player.target_lateral, STEER_SMOOTHING * dt);
-    transform.translation.z -= PLAYER_SPEED * dt;
+    let dashing = transform.translation.z > player.dash_until_z;
+    if !dashing {
+        player.dash_until_z = f32::INFINITY;
+    }
+    let speed = if dashing { PLAYER_SPEED * DASH_SPEED_MULT } else { PLAYER_SPEED };
+    transform.translation.z -= speed * dt;
     transform.translation.x = player.lateral;
 }
 
@@ -503,6 +591,7 @@ fn camera_follow_system(
 fn camera_settings_ui(
     mut contexts: EguiContexts,
     mut settings: ResMut<CameraSettings>,
+    flash: Res<FlashState>,
 ) -> Result {
     egui::Window::new("Camera")
         .default_open(false)
@@ -511,6 +600,20 @@ fn camera_settings_ui(
             ui.add(egui::Slider::new(&mut settings.distance, 1.0..=30.0).text("distance"));
             ui.add(egui::Slider::new(&mut settings.lerp, 0.5..=20.0).text("lerp speed"));
         });
+
+    if flash.timer > 0.0 && !flash.correct {
+        let alpha = (flash.timer * 2.5).min(1.0) * 0.35;
+        let color = egui::Color32::from_rgba_unmultiplied(220, 40, 40, (alpha * 255.0) as u8);
+        let ctx = contexts.ctx_mut()?;
+        let screen = ctx.viewport_rect();
+        egui::Area::new(egui::Id::new("flash"))
+            .fixed_pos(screen.min)
+            .order(egui::Order::Foreground)
+            .show(ctx, |ui| {
+                ui.painter().rect_filled(screen, 0.0, color);
+            });
+    }
+
     Ok(())
 }
 
@@ -568,14 +671,15 @@ fn manage_gates_system(
     while manager.next_z > pz - GATES_AHEAD as f32 * GATE_SPACING {
         let z = manager.next_z;
         let (question, correct, distractor) = deck.pick();
-        let (answer_l, answer_r) = if deck.rng.gen_bool(0.5) {
+        let correct_is_left = deck.rng.gen_bool(0.5);
+        let (answer_l, answer_r) = if correct_is_left {
             (correct, distractor)
         } else {
             (distractor, correct)
         };
         let entities = spawn_gate(
             &mut commands, &mut meshes, &mut materials,
-            text_mat.0.clone(), z, question, answer_l, answer_r,
+            text_mat.0.clone(), z, question, answer_l, answer_r, correct_is_left,
         );
         manager.live.push_back((z, entities));
         manager.next_z -= GATE_SPACING;
@@ -612,6 +716,45 @@ fn screenshot_system(mut commands: Commands, keys: Res<ButtonInput<KeyCode>>) {
             .spawn(Screenshot::primary_window())
             .observe(save_to_disk(path));
         info!("Screenshot saved to {path}");
+    }
+}
+
+fn gate_check_system(
+    time: Res<Time>,
+    player_q: Query<(&Transform, &Player)>,
+    mut post_q: Query<&mut GatePost>,
+    mut flash: ResMut<FlashState>,
+) {
+    let Ok((player_t, player)) = player_q.single() else { return };
+    let pz = player_t.translation.z;
+
+    for mut post in post_q.iter_mut() {
+        if !post.passed && pz < post.gate_z - 0.5 {
+            post.passed = true;
+            let player_side = if player.lateral <= 0.0 { -1.0 } else { 1.0 };
+            flash.correct = player_side == post.correct_side;
+            flash.timer = 0.6;
+        }
+    }
+
+    if flash.timer > 0.0 {
+        flash.timer -= time.delta_secs();
+    }
+}
+
+fn slide_signs_system(
+    time: Res<Time>,
+    player_q: Query<&Transform, With<Player>>,
+    mut sign_q: Query<(&SignSlide, &mut Transform), Without<Player>>,
+) {
+    let Ok(player_t) = player_q.single() else { return };
+    let pz = player_t.translation.z;
+    for (slide, mut transform) in sign_q.iter_mut() {
+        if pz < slide.gate_z {
+            let target_x = slide.dir * 10.0;
+            transform.translation.x =
+                transform.translation.x.lerp(target_x, 3.5 * time.delta_secs());
+        }
     }
 }
 
