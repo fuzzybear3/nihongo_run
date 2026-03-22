@@ -42,7 +42,7 @@ fn measure_screen() -> (u32, u32) {
 const PLAYER_SPEED: f32 = 10.0;
 const STEER_SMOOTHING: f32 = 8.0;
 const MAX_LATERAL: f32 = 2.0;
-const DASH_SPEED_MULT: f32 = 4.0;
+const DASH_SPEED_MULT: f32 = 6.8;
 const SWIPE_UP_VELOCITY: f32 = 800.0; // pixels per second upward
 const CAM_OFFSET_DEFAULT: Vec3 = Vec3::new(0.0, 2.5, 12.0);
 const CAM_LERP_DEFAULT: f32 = 6.0;
@@ -170,7 +170,8 @@ struct DragState {
     start_y: f32,
     current_y: f32,
     prev_y: f32,
-    dashed: bool, // prevents re-triggering in the same gesture
+    base_lateral: f32, // lateral offset at the moment the drag origin was set
+    dashed: bool,      // prevents re-triggering in the same gesture
     touch_id: Option<u64>,
 }
 
@@ -197,8 +198,8 @@ impl Deck {
 fn main() {
     let (w, h) = measure_screen();
 
-    App::new()
-        .add_plugins(
+    let mut app = App::new();
+    app.add_plugins(
             DefaultPlugins
                 .set(AssetPlugin {
                     meta_check: AssetMetaCheck::Never,
@@ -241,13 +242,19 @@ fn main() {
                 gate_check_system,
                 billboard_system,
                 slide_signs_system,
+                #[cfg(not(target_arch = "wasm32"))]
                 screenshot_system,
-                auto_screenshot_system,
             )
                 .chain(),
         )
-        .add_systems(EguiPrimaryContextPass, camera_settings_ui)
-        .run();
+        .add_systems(EguiPrimaryContextPass, camera_settings_ui);
+
+    #[cfg(not(target_arch = "wasm32"))]
+    if std::env::args().any(|a| a == "--screenshot") {
+        app.add_systems(Update, auto_screenshot_system);
+    }
+
+    app.run();
 }
 
 // ─── Startup ──────────────────────────────────────────────────────────────────
@@ -471,6 +478,7 @@ fn input_system(
         drag.start_y = touch.position().y;
         drag.current_y = drag.start_y;
         drag.prev_y = drag.start_y;
+        drag.base_lateral = 0.0;
         drag.dashed = false;
         drag.touch_id = Some(touch.id());
     }
@@ -501,6 +509,7 @@ fn input_system(
             drag.start_y = pos.y;
             drag.current_y = drag.start_y;
             drag.prev_y = drag.start_y;
+            drag.base_lateral = 0.0;
             drag.dashed = false;
         }
         if mouse.pressed(MouseButton::Left)
@@ -519,8 +528,9 @@ fn input_system(
     // Allow re-swiping once the previous dash has finished
     if player.dash_until_z == f32::INFINITY && drag.dashed {
         drag.dashed = false;
-        drag.start_y = drag.current_y; // reset origin so next swipe is measured fresh
+        drag.start_y = drag.current_y;
         drag.start_x = drag.current_x;
+        drag.base_lateral = player.lateral; // hold lane: delta=0 maps to current position
     }
 
     // Swipe-up detection: upward velocity exceeds threshold
@@ -555,9 +565,8 @@ fn steer_system(
     if drag.active {
         let delta = drag.current_x - drag.start_x;
         let normalized = (delta / (window.width() * 0.5)).clamp(-1.0, 1.0);
-        player.target_lateral = normalized * MAX_LATERAL;
-    } else {
-        player.target_lateral = 0.0;
+        player.target_lateral = (drag.base_lateral + normalized * MAX_LATERAL)
+            .clamp(-MAX_LATERAL, MAX_LATERAL);
     }
 }
 
@@ -709,6 +718,7 @@ fn billboard_system(
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn screenshot_system(mut commands: Commands, keys: Res<ButtonInput<KeyCode>>) {
     if keys.just_pressed(KeyCode::F12) {
         let path = "/tmp/nihongo_screenshot.png";
@@ -758,6 +768,7 @@ fn slide_signs_system(
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn auto_screenshot_system(mut commands: Commands, mut frame: Local<u32>) {
     *frame += 1;
     if *frame == 30 {
