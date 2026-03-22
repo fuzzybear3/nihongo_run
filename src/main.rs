@@ -1,10 +1,13 @@
+mod sr;
+
 use bevy::anti_alias::smaa::{Smaa, SmaaPreset};
 use bevy::render::alpha::AlphaMode;
 use bevy::render::view::screenshot::{Screenshot, save_to_disk};
 use bevy::{asset::AssetMetaCheck, prelude::*};
 use bevy_egui::{EguiContexts, EguiPlugin, EguiPrimaryContextPass, egui};
 use bevy_rich_text3d::{LoadFonts, Text3d, Text3dPlugin, Text3dStyling, TextAtlas};
-use rand::{Rng, SeedableRng, rngs::SmallRng};
+use rand::Rng;
+use sr::{N5_WORDS, Scheduler};
 use std::collections::VecDeque;
 use std::num::NonZero;
 
@@ -40,7 +43,8 @@ fn measure_screen() -> (u32, u32) {
 
 // ─── Game constants ───────────────────────────────────────────────────────────
 
-const STEER_SMOOTHING: f32 = 8.0;
+const STEER_SMOOTHING: f32 = 5.0;
+const DASH_STEER_SMOOTHING: f32 = 2.0;
 const MAX_LATERAL: f32 = 2.0;
 const DASH_SPEED_MULT: f32 = 6.8;
 const SWIPE_UP_VELOCITY: f32 = 800.0; // pixels per second upward
@@ -66,41 +70,6 @@ const GATES_AHEAD: u32 = 2;
 const SIGN_X_OFFSET: f32 = 1.8;
 const SIGN_SLIDE_TARGET: f32 = 10.0;
 const SIGN_SLIDE_SPEED: f32 = 3.5;
-
-// ─── N5 vocabulary ────────────────────────────────────────────────────────────
-// (hiragana reading, kanji/kana display)
-const N5_WORDS: &[(&str, &str)] = &[
-    ("みず", "水"),
-    ("ひ", "火"),
-    ("やま", "山"),
-    ("かわ", "川"),
-    ("き", "木"),
-    ("はな", "花"),
-    ("いぬ", "犬"),
-    ("ねこ", "猫"),
-    ("さかな", "魚"),
-    ("とり", "鳥"),
-    ("たべる", "食べる"),
-    ("のむ", "飲む"),
-    ("いく", "行く"),
-    ("くる", "来る"),
-    ("みる", "見る"),
-    ("きく", "聞く"),
-    ("はなす", "話す"),
-    ("かく", "書く"),
-    ("よむ", "読む"),
-    ("かう", "買う"),
-    ("おおきい", "大きい"),
-    ("ちいさい", "小さい"),
-    ("あたらしい", "新しい"),
-    ("ふるい", "古い"),
-    ("たかい", "高い"),
-    ("やすい", "安い"),
-    ("しろい", "白い"),
-    ("くろい", "黒い"),
-    ("あかい", "赤い"),
-    ("あおい", "青い"),
-];
 
 // ─── Components & Resources ───────────────────────────────────────────────────
 
@@ -146,6 +115,7 @@ struct GatePost {
     gate_z: f32,
     correct_side: f32, // -1.0 = left correct, +1.0 = right correct
     passed: bool,
+    word_index: usize,
 }
 
 #[derive(Resource, Default)]
@@ -177,11 +147,9 @@ struct GateManager {
 #[derive(Resource, Default)]
 struct DragState {
     active: bool,
-    start_x: f32,
     current_x: f32,
     current_y: f32,
     prev_y: f32,
-    base_lateral: f32,    // lateral offset at the moment the drag origin was set
     dash_triggered: bool, // swipe-up consumed for this gesture; cleared when dash resolves
     flick_dash: bool,     // finger released during dash — snap to center when gate passes
     touch_id: Option<u64>,
@@ -190,23 +158,6 @@ struct DragState {
 /// Shared material for all Text3d entities.
 #[derive(Resource)]
 struct TextMat(Handle<StandardMaterial>);
-
-#[derive(Resource)]
-struct Deck {
-    rng: SmallRng,
-}
-
-impl Deck {
-    fn pick(&mut self) -> (&'static str, &'static str, &'static str) {
-        let q = self.rng.gen_range(0..N5_WORDS.len());
-        let mut d = self.rng.gen_range(0..N5_WORDS.len() - 1);
-        if d >= q {
-            d += 1;
-        }
-        // question = kanji display, answers = hiragana readings
-        (N5_WORDS[q].1, N5_WORDS[q].0, N5_WORDS[d].0)
-    }
-}
 
 // ─── Main ─────────────────────────────────────────────────────────────────────
 
@@ -271,7 +222,7 @@ fn main() {
     )
     .add_systems(
         EguiPrimaryContextPass,
-        (camera_settings_ui, flash_overlay_ui),
+        (setup_egui_fonts, camera_settings_ui, flash_overlay_ui, sr_stats_ui),
     );
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -280,6 +231,28 @@ fn main() {
     }
 
     app.run();
+}
+
+// ─── Egui font setup ──────────────────────────────────────────────────────────
+
+fn setup_egui_fonts(mut contexts: EguiContexts, mut done: Local<bool>) -> Result {
+    if *done {
+        return Ok(());
+    }
+    *done = true;
+    let ctx = contexts.ctx_mut()?;
+    let mut fonts = egui::FontDefinitions::default();
+    fonts.font_data.insert(
+        "takao".to_owned(),
+        egui::FontData::from_static(include_bytes!("../assets/fonts/TakaoPGothic.ttf")).into(),
+    );
+    fonts
+        .families
+        .entry(egui::FontFamily::Proportional)
+        .or_default()
+        .insert(0, "takao".to_owned());
+    ctx.set_fonts(fonts);
+    Ok(())
 }
 
 // ─── Startup ──────────────────────────────────────────────────────────────────
@@ -298,9 +271,7 @@ fn setup(
         ..default()
     });
     commands.insert_resource(TextMat(text_mat));
-    commands.insert_resource(Deck {
-        rng: SmallRng::seed_from_u64(42),
-    });
+    commands.insert_resource(Scheduler::new());
     commands.insert_resource(FlashState::default());
 
     // Lighting
@@ -385,6 +356,7 @@ fn spawn_gate(
     answer_l: &str,
     answer_r: &str,
     correct_is_left: bool,
+    word_index: usize,
     s: f32,
 ) -> Vec<Entity> {
     let mut entities = Vec::new();
@@ -405,6 +377,7 @@ fn spawn_gate(
                     gate_z,
                     correct_side,
                     passed: false,
+                    word_index,
                 },
                 PostDrop { gate_z },
             ))
@@ -542,11 +515,9 @@ fn input_system(
     for touch in touches.iter_just_pressed() {
         touch_handled = true;
         drag.active = true;
-        drag.start_x = touch.position().x - half_w;
-        drag.current_x = drag.start_x;
+        drag.current_x = touch.position().x - half_w;
         drag.current_y = touch.position().y;
         drag.prev_y = drag.current_y;
-        drag.base_lateral = player.lateral;
         drag.touch_id = Some(touch.id());
     }
     for touch in touches.iter() {
@@ -574,11 +545,9 @@ fn input_system(
             && let Some(pos) = window.cursor_position()
         {
             drag.active = true;
-            drag.start_x = pos.x - half_w;
-            drag.current_x = drag.start_x;
+            drag.current_x = pos.x - half_w;
             drag.current_y = pos.y;
             drag.prev_y = drag.current_y;
-            drag.base_lateral = player.lateral;
         }
         if mouse.pressed(MouseButton::Left)
             && let Some(pos) = window.cursor_position()
@@ -596,11 +565,9 @@ fn input_system(
         }
     }
 
-    // Hold dash ended: hold lane and allow re-swiping
+    // Hold dash ended: allow re-swiping
     if !player.dashing && drag.dash_triggered {
         drag.dash_triggered = false;
-        drag.start_x = drag.current_x;
-        drag.base_lateral = player.lateral;
     // Flick dash ended: snap to center
     } else if !player.dashing && drag.flick_dash {
         drag.flick_dash = false;
@@ -631,10 +598,8 @@ fn steer_system(
     };
 
     if drag.active {
-        let delta = drag.current_x - drag.start_x;
-        let normalized = (delta / (window.width() * 0.5)).clamp(-1.0, 1.0);
-        player.target_lateral =
-            (drag.base_lateral + normalized * MAX_LATERAL).clamp(-MAX_LATERAL, MAX_LATERAL);
+        let normalized = (drag.current_x / (window.width() * 0.5)).clamp(-1.0, 1.0);
+        player.target_lateral = normalized * MAX_LATERAL;
     }
 }
 
@@ -647,9 +612,10 @@ fn move_system(
         return;
     };
     let dt = time.delta_secs();
+    let smoothing = if player.dashing { DASH_STEER_SMOOTHING } else { STEER_SMOOTHING };
     player.lateral = player
         .lateral
-        .lerp(player.target_lateral, STEER_SMOOTHING * dt);
+        .lerp(player.target_lateral, smoothing * dt);
     let speed = if player.dashing {
         settings.player_speed * DASH_SPEED_MULT
     } else {
@@ -721,6 +687,74 @@ fn flash_overlay_ui(mut contexts: EguiContexts, flash: Res<FlashState>) -> Resul
     Ok(())
 }
 
+fn sr_stats_ui(mut contexts: EguiContexts, scheduler: Res<Scheduler>) -> Result {
+    let cards = &scheduler.cards;
+    let now = scheduler.gate_pass_count;
+    let due   = cards.iter().filter(|c| c.due_at <= now && c.reps > 0).count();
+    let new   = cards.iter().filter(|c| c.reps == 0).count();
+    let learn = cards.iter().filter(|c| c.reps > 0 && c.interval < 21.0).count();
+    let rev   = cards.iter().filter(|c| c.interval >= 21.0).count();
+
+    egui::Window::new("SR Stats")
+        .default_open(true)
+        .default_width(320.0)
+        .show(contexts.ctx_mut()?, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(format!("passes: {now}"));
+                ui.separator();
+                ui.label(format!("new: {new}"));
+                ui.label(format!("due: {due}"));
+                ui.label(format!("learn: {learn}"));
+                ui.label(format!("review: {rev}"));
+            });
+            ui.separator();
+
+            egui::ScrollArea::vertical().max_height(300.0).show(ui, |ui| {
+                egui::Grid::new("sr_cards")
+                    .striped(true)
+                    .spacing([8.0, 2.0])
+                    .show(ui, |ui| {
+                        // Header
+                        ui.strong("kanji");
+                        ui.strong("kana");
+                        ui.strong("status");
+                        ui.strong("reps");
+                        ui.strong("ivl");
+                        ui.strong("ease");
+                        ui.strong("due in");
+                        ui.end_row();
+
+                        for (i, card) in cards.iter().enumerate() {
+                            let (kana, kanji) = N5_WORDS[i];
+                            let status = if card.reps == 0 {
+                                "new"
+                            } else if card.due_at <= now {
+                                "due"
+                            } else if card.interval < 21.0 {
+                                "learn"
+                            } else {
+                                "review"
+                            };
+                            let due_in = card.due_at.saturating_sub(now);
+                            ui.label(kanji);
+                            ui.label(kana);
+                            ui.label(status);
+                            ui.label(card.reps.to_string());
+                            ui.label(format!("{:.0}", card.interval));
+                            ui.label(format!("{:.2}", card.ease));
+                            ui.label(if card.reps == 0 {
+                                "-".to_string()
+                            } else {
+                                due_in.to_string()
+                            });
+                            ui.end_row();
+                        }
+                    });
+            });
+        });
+    Ok(())
+}
+
 fn manage_tiles_system(
     mut commands: Commands,
     mut manager: ResMut<TileManager>,
@@ -767,7 +801,7 @@ fn manage_gates_system(
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut manager: ResMut<GateManager>,
-    mut deck: ResMut<Deck>,
+    mut scheduler: ResMut<Scheduler>,
     text_mat: Res<TextMat>,
     settings: Res<CameraSettings>,
     player_q: Query<&Transform, With<Player>>,
@@ -779,8 +813,8 @@ fn manage_gates_system(
 
     while manager.next_z > pz - GATES_AHEAD as f32 * settings.gate_spacing {
         let z = manager.next_z;
-        let (question, correct, distractor) = deck.pick();
-        let correct_is_left = deck.rng.gen_bool(0.5);
+        let (question, correct, distractor, word_index) = scheduler.pick();
+        let correct_is_left = scheduler.rng.gen_bool(0.5);
         let (answer_l, answer_r) = if correct_is_left {
             (correct, distractor)
         } else {
@@ -796,6 +830,7 @@ fn manage_gates_system(
             answer_l,
             answer_r,
             correct_is_left,
+            word_index,
             settings.gate_scale,
         );
         manager.live.push_back((z, entities));
@@ -842,6 +877,7 @@ fn gate_check_system(
     mut player_q: Query<(&Transform, &mut Player)>,
     mut post_q: Query<&mut GatePost>,
     mut flash: ResMut<FlashState>,
+    mut scheduler: ResMut<Scheduler>,
 ) {
     let Ok((player_t, mut player)) = player_q.single_mut() else {
         return;
@@ -853,8 +889,11 @@ fn gate_check_system(
             post.passed = true;
             player.dashing = false;
             let player_side = if player.lateral <= 0.0 { -1.0 } else { 1.0 };
-            flash.correct = player_side == post.correct_side;
+            let correct = player_side == post.correct_side;
+            flash.correct = correct;
             flash.timer = 0.6;
+            scheduler.record(post.word_index, correct);
+            scheduler.gate_pass_count += 1;
         }
     }
 
