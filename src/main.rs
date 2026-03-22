@@ -415,7 +415,7 @@ fn spawn_gate(
     entities.push(
         commands
             .spawn((
-                Mesh3d(meshes.add(Cuboid::new(5.0 * s, 1.5 * s, 0.12))),
+                Mesh3d(meshes.add(Cuboid::new(2.5 * s, 2.5 * s, 0.12))),
                 MeshMaterial3d(materials.add(StandardMaterial {
                     base_color: Color::srgb(0.95, 0.90, 0.75),
                     perceptual_roughness: 0.6,
@@ -436,7 +436,7 @@ fn spawn_gate(
                     color: Srgba::new(0.12, 0.06, 0.01, 1.0),
                     stroke: NonZero::new(4),
                     stroke_color: Srgba::new(1.0, 0.95, 0.8, 1.0),
-                    world_scale: Some(Vec2::splat(0.6 * s)),
+                    world_scale: Some(Vec2::splat(1.2 * s)),
                     ..default()
                 },
                 Mesh3d::default(),
