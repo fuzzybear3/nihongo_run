@@ -1,4 +1,5 @@
 use bevy::{asset::AssetMetaCheck, prelude::*};
+use bevy_egui::{EguiContexts, EguiPlugin, EguiPrimaryContextPass, egui};
 
 // ─── Window constants ─────────────────────────────────────────────────────────
 
@@ -35,13 +36,23 @@ fn measure_screen() -> (u32, u32) {
 const PLAYER_SPEED: f32 = 10.0;
 const STEER_SMOOTHING: f32 = 8.0;
 const MAX_LATERAL: f32 = 2.0;
-const CAM_OFFSET: Vec3 = Vec3::new(0.0, 4.5, 8.0);
-const CAM_LERP: f32 = 6.0;
+const CAM_OFFSET_DEFAULT: Vec3 = Vec3::new(0.0, 2.5, 12.0);
+const CAM_LERP_DEFAULT: f32 = 6.0;
+
+#[derive(Resource)]
+struct CameraSettings {
+    height: f32,   // Y component of offset
+    distance: f32, // Z component of offset
+    lerp: f32,
+}
 
 const TILE_LENGTH: f32 = 20.0;
 const TILE_WIDTH: f32 = 5.0;
-const TILES_AHEAD: i32 = 6; // how many tiles to keep in front of the player
-const TILES_BEHIND: i32 = 3; // how many tiles to keep behind the player
+const TILES_AHEAD: i32 = 6;
+const TILES_BEHIND: i32 = 3;
+
+const GATE_SPACING: f32 = 80.0; // distance between gates
+const GATES_AHEAD: u32 = 2; // how many gates to keep spawned in front
 
 // ─── Components & Resources ───────────────────────────────────────────────────
 
@@ -56,6 +67,17 @@ struct CameraMarker;
 
 #[derive(Component)]
 struct Tile;
+
+/// Makes an entity rotate around Y each frame to face the camera.
+#[derive(Component)]
+struct Billboard;
+
+/// Marks the left or right answer sign on a decision gate.
+#[derive(Component)]
+enum GateSign {
+    Left,
+    Right,
+}
 
 #[derive(Resource)]
 struct TileAssets {
@@ -72,6 +94,13 @@ struct TileManager {
     spawned: std::collections::VecDeque<(f32, Entity)>,
     /// Increments each spawn so we can alternate materials
     count: u32,
+}
+
+#[derive(Resource)]
+struct GateManager {
+    next_z: f32,
+    /// (gate_z, all entities in that gate) for despawning
+    live: std::collections::VecDeque<(f32, Vec<Entity>)>,
 }
 
 #[derive(Resource, Default)]
@@ -104,8 +133,14 @@ fn main() {
                     ..default()
                 }),
         )
+        .add_plugins(EguiPlugin::default())
         .insert_resource(ClearColor(Color::srgb(0.4, 0.65, 0.85)))
         .insert_resource(DragState::default())
+        .insert_resource(CameraSettings {
+            height: CAM_OFFSET_DEFAULT.y,
+            distance: CAM_OFFSET_DEFAULT.z,
+            lerp: CAM_LERP_DEFAULT,
+        })
         .add_systems(Startup, setup)
         .add_systems(
             Update,
@@ -115,9 +150,12 @@ fn main() {
                 move_system,
                 camera_follow_system,
                 manage_tiles_system,
+                manage_gates_system,
+                billboard_system,
             )
                 .chain(),
         )
+        .add_systems(EguiPrimaryContextPass, camera_settings_ui)
         .run();
 }
 
@@ -184,9 +222,92 @@ fn setup(
     commands.spawn((
         Camera3d::default(),
         Msaa::Off,
-        Transform::from_translation(CAM_OFFSET).looking_at(Vec3::ZERO, Vec3::Y),
+        Transform::from_translation(CAM_OFFSET_DEFAULT).looking_at(Vec3::ZERO, Vec3::Y),
         CameraMarker,
     ));
+
+    commands.insert_resource(GateManager {
+        next_z: -50.0,
+        live: std::collections::VecDeque::new(),
+    });
+}
+
+fn spawn_gate(
+    commands: &mut Commands,
+    meshes: &mut Assets<Mesh>,
+    materials: &mut Assets<StandardMaterial>,
+    gate_z: f32,
+) -> Vec<Entity> {
+    let mut entities = Vec::new();
+
+    // ── Center post (torii vermillion) ──
+    entities.push(
+        commands
+            .spawn((
+                Mesh3d(meshes.add(Cylinder::new(0.18, 4.8))),
+                MeshMaterial3d(materials.add(StandardMaterial {
+                    base_color: Color::srgb(0.85, 0.15, 0.05),
+                    perceptual_roughness: 0.5,
+                    ..default()
+                })),
+                Transform::from_xyz(0.0, 2.4, gate_z),
+            ))
+            .id(),
+    );
+
+    // ── Question crossbeam — spans the gate, holds the prompt ──
+    entities.push(
+        commands
+            .spawn((
+                Mesh3d(meshes.add(Cuboid::new(5.0, 1.5, 0.15))),
+                MeshMaterial3d(materials.add(StandardMaterial {
+                    base_color: Color::srgb(0.95, 0.90, 0.75), // parchment
+                    perceptual_roughness: 0.6,
+                    ..default()
+                })),
+                Transform::from_xyz(0.0, 5.8, gate_z),
+                Billboard,
+            ))
+            .id(),
+    );
+
+    let sign_mesh = meshes.add(Cuboid::new(2.2, 2.5, 0.12));
+
+    // Left sign — warm gold
+    entities.push(
+        commands
+            .spawn((
+                Mesh3d(sign_mesh.clone()),
+                MeshMaterial3d(materials.add(StandardMaterial {
+                    base_color: Color::srgb(0.9, 0.72, 0.08),
+                    perceptual_roughness: 0.4,
+                    ..default()
+                })),
+                Transform::from_xyz(-1.8, 3.2, gate_z + 0.1),
+                Billboard,
+                GateSign::Left,
+            ))
+            .id(),
+    );
+
+    // Right sign — cool blue
+    entities.push(
+        commands
+            .spawn((
+                Mesh3d(sign_mesh),
+                MeshMaterial3d(materials.add(StandardMaterial {
+                    base_color: Color::srgb(0.1, 0.4, 0.85),
+                    perceptual_roughness: 0.4,
+                    ..default()
+                })),
+                Transform::from_xyz(1.8, 3.2, gate_z - 0.1),
+                Billboard,
+                GateSign::Right,
+            ))
+            .id(),
+    );
+
+    entities
 }
 
 // ─── Systems ──────────────────────────────────────────────────────────────────
@@ -280,6 +401,7 @@ fn move_system(time: Res<Time>, mut player_q: Query<(&mut Player, &mut Transform
 
 fn camera_follow_system(
     time: Res<Time>,
+    settings: Res<CameraSettings>,
     player_q: Query<&Transform, (With<Player>, Without<CameraMarker>)>,
     mut cam_q: Query<&mut Transform, (With<CameraMarker>, Without<Player>)>,
 ) {
@@ -290,9 +412,23 @@ fn camera_follow_system(
         return;
     };
 
-    let ideal = player_t.translation + CAM_OFFSET;
-    cam_t.translation = cam_t.translation.lerp(ideal, CAM_LERP * time.delta_secs());
+    let offset = Vec3::new(0.0, settings.height, settings.distance);
+    let ideal = player_t.translation + offset;
+    cam_t.translation = cam_t
+        .translation
+        .lerp(ideal, settings.lerp * time.delta_secs());
     cam_t.look_at(player_t.translation + Vec3::Y * 0.5, Vec3::Y);
+}
+
+fn camera_settings_ui(mut contexts: EguiContexts, mut settings: ResMut<CameraSettings>) -> Result {
+    egui::Window::new("Camera")
+        .default_open(false)
+        .show(contexts.ctx_mut()?, |ui| {
+            ui.add(egui::Slider::new(&mut settings.height, 0.5..=20.0).text("height"));
+            ui.add(egui::Slider::new(&mut settings.distance, 1.0..=30.0).text("distance"));
+            ui.add(egui::Slider::new(&mut settings.lerp, 0.5..=20.0).text("lerp speed"));
+        });
+    Ok(())
 }
 
 fn manage_tiles_system(
@@ -336,5 +472,52 @@ fn manage_tiles_system(
         } else {
             break;
         }
+    }
+}
+
+fn manage_gates_system(
+    mut commands: Commands,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut manager: ResMut<GateManager>,
+    player_q: Query<&Transform, With<Player>>,
+) {
+    let Ok(player_t) = player_q.single() else {
+        return;
+    };
+    let pz = player_t.translation.z;
+
+    // Spawn gates until we have GATES_AHEAD in front of the player
+    while manager.next_z > pz - GATES_AHEAD as f32 * GATE_SPACING {
+        let z = manager.next_z;
+        let entities = spawn_gate(&mut commands, &mut meshes, &mut materials, z);
+        manager.live.push_back((z, entities));
+        manager.next_z -= GATE_SPACING;
+    }
+
+    // Despawn gates that are one spacing behind the player
+    while let Some((gate_z, entities)) = manager.live.front() {
+        if *gate_z > pz + GATE_SPACING {
+            for &e in entities {
+                commands.entity(e).despawn();
+            }
+            manager.live.pop_front();
+        } else {
+            break;
+        }
+    }
+}
+
+fn billboard_system(
+    cam_q: Query<&Transform, With<CameraMarker>>,
+    mut sign_q: Query<&mut Transform, (With<Billboard>, Without<CameraMarker>)>,
+) {
+    let Ok(cam_t) = cam_q.single() else { return };
+    for mut transform in sign_q.iter_mut() {
+        let to_cam = cam_t.translation - transform.translation;
+        // atan2 is stable even when camera is nearly directly behind the sign.
+        // yaw = angle of (to_cam) in XZ plane from +Z, then +PI so -Z faces camera.
+        let yaw = f32::atan2(to_cam.x, to_cam.z) + std::f32::consts::PI;
+        transform.rotation = Quat::from_rotation_y(yaw);
     }
 }
