@@ -265,7 +265,7 @@ fn setup(
     // Shared material for all Text3d entities
     let text_mat = materials.add(StandardMaterial {
         base_color_texture: Some(TextAtlas::DEFAULT_IMAGE.clone()),
-        alpha_mode: AlphaMode::Mask(0.5),
+        alpha_mode: AlphaMode::Blend,
         unlit: true,
         cull_mode: None,
         ..default()
