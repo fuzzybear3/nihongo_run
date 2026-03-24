@@ -1,2 +1,9 @@
+# Rust / Cargo
 /target
+
+# Trunk / WASM build output
 /dist
+.trunk/
+
+# Environment / secrets
+.env
