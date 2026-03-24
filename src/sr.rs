@@ -1,40 +1,6 @@
 use bevy::prelude::Resource;
 use rand::{Rng, SeedableRng, rngs::SmallRng};
 
-// (hiragana reading, kanji/kana display)
-pub const N5_WORDS: &[(&str, &str)] = &[
-    ("みず", "水"),
-    ("ひ", "火"),
-    ("やま", "山"),
-    ("かわ", "川"),
-    ("き", "木"),
-    ("はな", "花"),
-    ("いぬ", "犬"),
-    ("ねこ", "猫"),
-    ("さかな", "魚"),
-    ("とり", "鳥"),
-    ("たべる", "食べる"),
-    ("のむ", "飲む"),
-    ("いく", "行く"),
-    ("くる", "来る"),
-    ("みる", "見る"),
-    ("きく", "聞く"),
-    ("はなす", "話す"),
-    ("かく", "書く"),
-    ("よむ", "読む"),
-    ("かう", "買う"),
-    ("おおきい", "大きい"),
-    ("ちいさい", "小さい"),
-    ("あたらしい", "新しい"),
-    ("ふるい", "古い"),
-    ("たかい", "高い"),
-    ("やすい", "安い"),
-    ("しろい", "白い"),
-    ("くろい", "黒い"),
-    ("あかい", "赤い"),
-    ("あおい", "青い"),
-];
-
 pub struct CardState {
     pub interval: f32, // gate-passes until next review
     pub ease: f32,     // interval multiplier (default 2.5)
@@ -50,6 +16,8 @@ impl Default for CardState {
 
 #[derive(Resource)]
 pub struct Scheduler {
+    /// `(hiragana, display)` — display is kanji when available, else hiragana.
+    pub words: Vec<(String, String)>,
     pub cards: Vec<CardState>,
     pub gate_pass_count: u32,
     pub rng: SmallRng,
@@ -58,32 +26,46 @@ pub struct Scheduler {
 impl Scheduler {
     pub fn new() -> Self {
         Self {
-            cards: (0..N5_WORDS.len()).map(|_| CardState::default()).collect(),
+            words: Vec::new(),
+            cards: Vec::new(),
             gate_pass_count: 0,
             rng: SmallRng::seed_from_u64(42),
         }
     }
 
-    /// Returns (kanji_display, correct_hiragana, distractor_hiragana, word_index).
-    pub fn pick(&mut self) -> (&'static str, &'static str, &'static str, usize) {
-        let due: Vec<usize> = (0..self.cards.len())
+    /// Called once words arrive from Supabase. Resets all card state.
+    pub fn load_words(&mut self, words: Vec<(String, String)>) {
+        let n = words.len();
+        self.words = words;
+        self.cards = (0..n).map(|_| CardState::default()).collect();
+    }
+
+    pub fn is_ready(&self) -> bool {
+        !self.words.is_empty()
+    }
+
+    /// Returns `(display, correct_hiragana, distractor_hiragana, word_index)`.
+    pub fn pick(&mut self) -> (String, String, String, usize) {
+        let n = self.words.len();
+        let due: Vec<usize> = (0..n)
             .filter(|&i| self.cards[i].due_at <= self.gate_pass_count)
             .collect();
 
         let q = if !due.is_empty() {
-            let i = self.rng.gen_range(0..due.len());
-            due[i]
+            due[self.rng.gen_range(0..due.len())]
         } else {
-            // No cards due yet — pick the soonest upcoming one
-            (0..self.cards.len())
-                .min_by_key(|&i| self.cards[i].due_at)
-                .unwrap_or(0)
+            (0..n).min_by_key(|&i| self.cards[i].due_at).unwrap_or(0)
         };
 
-        let mut d = self.rng.gen_range(0..N5_WORDS.len() - 1);
+        let mut d = self.rng.gen_range(0..n - 1);
         if d >= q { d += 1; }
 
-        (N5_WORDS[q].1, N5_WORDS[q].0, N5_WORDS[d].0, q)
+        (
+            self.words[q].1.clone(),
+            self.words[q].0.clone(),
+            self.words[d].0.clone(),
+            q,
+        )
     }
 
     /// Update the SM-2 state for `word_index` based on whether the answer was correct.

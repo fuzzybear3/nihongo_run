@@ -1,13 +1,15 @@
 mod sr;
+mod supabase;
 
 use bevy::anti_alias::smaa::{Smaa, SmaaPreset};
 use bevy::render::alpha::AlphaMode;
 use bevy::render::view::screenshot::{Screenshot, save_to_disk};
+use bevy::tasks::{IoTaskPool, Task};
 use bevy::{asset::AssetMetaCheck, prelude::*};
 use bevy_egui::{EguiContexts, EguiPlugin, EguiPrimaryContextPass, egui};
 use bevy_rich_text3d::{LoadFonts, Text3d, Text3dPlugin, Text3dStyling, TextAtlas};
 use rand::Rng;
-use sr::{N5_WORDS, Scheduler};
+use sr::Scheduler;
 use std::collections::VecDeque;
 use std::num::NonZero;
 
@@ -66,7 +68,8 @@ const TILE_WIDTH: f32 = 5.0;
 const TILES_AHEAD: i32 = 6;
 const TILES_BEHIND: i32 = 3;
 
-const GATES_AHEAD: u32 = 2;
+const GATES_AHEAD: usize = 2;
+const GATES_BEHIND: usize = 1;
 const SIGN_X_OFFSET: f32 = 1.8;
 const SIGN_SLIDE_TARGET: f32 = 10.0;
 const SIGN_SLIDE_SPEED: f32 = 3.5;
@@ -155,9 +158,34 @@ struct DragState {
     touch_id: Option<u64>,
 }
 
+/// In-flight async task that fetches words from Supabase.
+#[derive(Resource)]
+struct WordsTask(Task<Vec<(String, String)>>);
+
 /// Shared material for all Text3d entities.
 #[derive(Resource)]
 struct TextMat(Handle<StandardMaterial>);
+
+/// Pre-created gate geometry and materials — reused for every gate spawn.
+#[derive(Resource)]
+struct GateAssets {
+    post_mesh: Handle<Mesh>,
+    crossbeam_mesh: Handle<Mesh>,
+    sign_mesh: Handle<Mesh>,
+    post_mat: Handle<StandardMaterial>,
+    crossbeam_mat: Handle<StandardMaterial>,
+    sign_mat_yellow: Handle<StandardMaterial>,
+    sign_mat_blue: Handle<StandardMaterial>,
+}
+
+// ─── Game state ───────────────────────────────────────────────────────────────
+
+#[derive(States, Default, Debug, Clone, PartialEq, Eq, Hash)]
+enum GameState {
+    #[default]
+    Loading,
+    Playing,
+}
 
 // ─── Main ─────────────────────────────────────────────────────────────────────
 
@@ -188,6 +216,7 @@ fn main() {
     })
     .add_plugins(Text3dPlugin::default())
     .add_plugins(EguiPlugin::default())
+    .init_state::<GameState>()
     .insert_resource(ClearColor(Color::srgb(0.4, 0.65, 0.85)))
     .insert_resource(DragState::default())
     .insert_resource(CameraSettings {
@@ -200,6 +229,17 @@ fn main() {
         gate_spacing: 125.0,
     })
     .add_systems(Startup, setup)
+    // Always-running systems (both states)
+    .add_systems(
+        Update,
+        (
+            poll_words_system,
+            check_loading_system.run_if(in_state(GameState::Loading)),
+            #[cfg(not(target_arch = "wasm32"))]
+            screenshot_system,
+        ),
+    )
+    // Gameplay systems — only run once words are loaded
     .add_systems(
         Update,
         (
@@ -215,14 +255,19 @@ fn main() {
             slide_signs_system,
             drop_posts_system,
             rise_crossbeam_system,
-            #[cfg(not(target_arch = "wasm32"))]
-            screenshot_system,
         )
-            .chain(),
+            .chain()
+            .run_if(in_state(GameState::Playing)),
     )
     .add_systems(
         EguiPrimaryContextPass,
-        (setup_egui_fonts, camera_settings_ui, flash_overlay_ui, sr_stats_ui),
+        (
+            setup_egui_fonts,
+            loading_ui.run_if(in_state(GameState::Loading)),
+            camera_settings_ui.run_if(in_state(GameState::Playing)),
+            flash_overlay_ui.run_if(in_state(GameState::Playing)),
+            sr_stats_ui.run_if(in_state(GameState::Playing)),
+        ),
     );
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -255,6 +300,44 @@ fn setup_egui_fonts(mut contexts: EguiContexts, mut done: Local<bool>) -> Result
     Ok(())
 }
 
+// ─── Words loading ────────────────────────────────────────────────────────────
+
+fn poll_words_system(
+    mut commands: Commands,
+    task: Option<ResMut<WordsTask>>,
+    mut scheduler: ResMut<Scheduler>,
+) {
+    let Some(mut task) = task else { return };
+    if let Some(words) =
+        bevy::tasks::block_on(bevy::tasks::futures_lite::future::poll_once(&mut task.0))
+    {
+        info!("loaded {} words from Supabase", words.len());
+        scheduler.load_words(words);
+        commands.remove_resource::<WordsTask>();
+    }
+}
+
+fn check_loading_system(
+    scheduler: Res<Scheduler>,
+    mut next_state: ResMut<NextState<GameState>>,
+) {
+    if scheduler.is_ready() {
+        next_state.set(GameState::Playing);
+    }
+}
+
+fn loading_ui(mut contexts: EguiContexts) -> Result {
+    let ctx = contexts.ctx_mut()?;
+    egui::CentralPanel::default()
+        .frame(egui::Frame::NONE.fill(egui::Color32::from_black_alpha(180)))
+        .show(ctx, |ui| {
+            ui.centered_and_justified(|ui| {
+                ui.heading("Loading words...");
+            });
+        });
+    Ok(())
+}
+
 // ─── Startup ──────────────────────────────────────────────────────────────────
 
 fn setup(
@@ -273,6 +356,10 @@ fn setup(
     commands.insert_resource(TextMat(text_mat));
     commands.insert_resource(Scheduler::new());
     commands.insert_resource(FlashState::default());
+
+    // Kick off async fetch of words from Supabase.
+    let task = IoTaskPool::get().spawn(supabase::fetch_words());
+    commands.insert_resource(WordsTask(task));
 
     // Lighting
     commands.insert_resource(GlobalAmbientLight {
@@ -311,6 +398,31 @@ fn setup(
         spawned: std::collections::VecDeque::new(),
         count: 0,
     });
+    commands.insert_resource(GateAssets {
+        post_mesh: meshes.add(Cylinder::new(0.18, 4.8)),
+        crossbeam_mesh: meshes.add(Cuboid::new(2.5, 2.5, 0.12)),
+        sign_mesh: meshes.add(Cuboid::new(3.0, 2.5, 0.12)),
+        post_mat: materials.add(StandardMaterial {
+            base_color: Color::srgb(0.85, 0.15, 0.05),
+            perceptual_roughness: 0.5,
+            ..default()
+        }),
+        crossbeam_mat: materials.add(StandardMaterial {
+            base_color: Color::srgb(0.95, 0.90, 0.75),
+            perceptual_roughness: 0.6,
+            ..default()
+        }),
+        sign_mat_yellow: materials.add(StandardMaterial {
+            base_color: Color::srgb(0.9, 0.72, 0.08),
+            perceptual_roughness: 0.4,
+            ..default()
+        }),
+        sign_mat_blue: materials.add(StandardMaterial {
+            base_color: Color::srgb(0.1, 0.40, 0.85),
+            perceptual_roughness: 0.4,
+            ..default()
+        }),
+    });
 
     // Player
     commands.spawn((
@@ -348,8 +460,7 @@ fn setup(
 
 fn spawn_gate(
     commands: &mut Commands,
-    meshes: &mut Assets<Mesh>,
-    materials: &mut Assets<StandardMaterial>,
+    gate_assets: &GateAssets,
     text_mat: Handle<StandardMaterial>,
     gate_z: f32,
     question: &str,
@@ -366,19 +477,10 @@ fn spawn_gate(
     entities.push(
         commands
             .spawn((
-                Mesh3d(meshes.add(Cylinder::new(0.18 * s, 4.8 * s))),
-                MeshMaterial3d(materials.add(StandardMaterial {
-                    base_color: Color::srgb(0.85, 0.15, 0.05),
-                    perceptual_roughness: 0.5,
-                    ..default()
-                })),
-                Transform::from_xyz(0.0, 2.4 * s, gate_z),
-                GatePost {
-                    gate_z,
-                    correct_side,
-                    passed: false,
-                    word_index,
-                },
+                Mesh3d(gate_assets.post_mesh.clone()),
+                MeshMaterial3d(gate_assets.post_mat.clone()),
+                Transform::from_xyz(0.0, 2.4 * s, gate_z).with_scale(Vec3::splat(s)),
+                GatePost { gate_z, correct_side, passed: false, word_index },
                 PostDrop { gate_z },
             ))
             .id(),
@@ -388,13 +490,9 @@ fn spawn_gate(
     entities.push(
         commands
             .spawn((
-                Mesh3d(meshes.add(Cuboid::new(2.5 * s, 2.5 * s, 0.12))),
-                MeshMaterial3d(materials.add(StandardMaterial {
-                    base_color: Color::srgb(0.95, 0.90, 0.75),
-                    perceptual_roughness: 0.6,
-                    ..default()
-                })),
-                Transform::from_xyz(0.0, 5.8 * s, gate_z),
+                Mesh3d(gate_assets.crossbeam_mesh.clone()),
+                MeshMaterial3d(gate_assets.crossbeam_mat.clone()),
+                Transform::from_xyz(0.0, 5.8 * s, gate_z).with_scale(Vec3::splat(s)),
                 Billboard,
                 CrossbeamRise { gate_z },
             ))
@@ -421,28 +519,13 @@ fn spawn_gate(
             .id(),
     );
 
-    let sign_mesh = meshes.add(Cuboid::new(3.0 * s, 2.5 * s, 0.12));
     let [l0, l1] = spawn_sign(
-        commands,
-        &sign_mesh,
-        materials,
-        text_mat.clone(),
-        gate_z,
-        -SIGN_X_OFFSET * s,
-        Color::srgb(0.9, 0.72, 0.08),
-        answer_l,
-        s,
+        commands, gate_assets, text_mat.clone(),
+        gate_z, -SIGN_X_OFFSET * s, gate_assets.sign_mat_yellow.clone(), answer_l, s,
     );
     let [r0, r1] = spawn_sign(
-        commands,
-        &sign_mesh,
-        materials,
-        text_mat,
-        gate_z,
-        SIGN_X_OFFSET * s,
-        Color::srgb(0.1, 0.40, 0.85),
-        answer_r,
-        s,
+        commands, gate_assets, text_mat,
+        gate_z, SIGN_X_OFFSET * s, gate_assets.sign_mat_blue.clone(), answer_r, s,
     );
     entities.extend([l0, l1, r0, r1]);
 
@@ -451,25 +534,20 @@ fn spawn_gate(
 
 fn spawn_sign(
     commands: &mut Commands,
-    sign_mesh: &Handle<Mesh>,
-    materials: &mut Assets<StandardMaterial>,
+    gate_assets: &GateAssets,
     text_mat: Handle<StandardMaterial>,
     gate_z: f32,
     x: f32,
-    bg_color: Color,
+    sign_mat: Handle<StandardMaterial>,
     text: &str,
     s: f32,
 ) -> [Entity; 2] {
     let dir = x.signum();
     let bg = commands
         .spawn((
-            Mesh3d(sign_mesh.clone()),
-            MeshMaterial3d(materials.add(StandardMaterial {
-                base_color: bg_color,
-                perceptual_roughness: 0.4,
-                ..default()
-            })),
-            Transform::from_xyz(x, 3.2 * s, gate_z),
+            Mesh3d(gate_assets.sign_mesh.clone()),
+            MeshMaterial3d(sign_mat),
+            Transform::from_xyz(x, 3.2 * s, gate_z).with_scale(Vec3::splat(s)),
             Billboard,
             SignSlide { gate_z, dir },
         ))
@@ -480,7 +558,7 @@ fn spawn_sign(
             Text3dStyling {
                 size: 96.0,
                 color: Srgba::new(0.05, 0.05, 0.1, 1.0),
-                world_scale: Some(Vec2::splat(1.0 * s)),
+                world_scale: Some(Vec2::splat(s)),
                 ..default()
             },
             Mesh3d::default(),
@@ -696,7 +774,7 @@ fn sr_stats_ui(mut contexts: EguiContexts, scheduler: Res<Scheduler>) -> Result 
     let rev   = cards.iter().filter(|c| c.interval >= 21.0).count();
 
     egui::Window::new("SR Stats")
-        .default_open(true)
+        .default_open(false)
         .default_width(320.0)
         .show(contexts.ctx_mut()?, |ui| {
             ui.horizontal(|ui| {
@@ -725,7 +803,7 @@ fn sr_stats_ui(mut contexts: EguiContexts, scheduler: Res<Scheduler>) -> Result 
                         ui.end_row();
 
                         for (i, card) in cards.iter().enumerate() {
-                            let (kana, kanji) = N5_WORDS[i];
+                            let (kana, kanji) = &scheduler.words[i];
                             let status = if card.reps == 0 {
                                 "new"
                             } else if card.due_at <= now {
@@ -798,10 +876,9 @@ fn manage_tiles_system(
 
 fn manage_gates_system(
     mut commands: Commands,
-    mut meshes: ResMut<Assets<Mesh>>,
-    mut materials: ResMut<Assets<StandardMaterial>>,
     mut manager: ResMut<GateManager>,
     mut scheduler: ResMut<Scheduler>,
+    gate_assets: Res<GateAssets>,
     text_mat: Res<TextMat>,
     settings: Res<CameraSettings>,
     player_q: Query<&Transform, With<Player>>,
@@ -809,9 +886,15 @@ fn manage_gates_system(
     let Ok(player_t) = player_q.single() else {
         return;
     };
+    if !scheduler.is_ready() {
+        return; // words not yet loaded from Supabase
+    }
     let pz = player_t.translation.z;
 
-    while manager.next_z > pz - GATES_AHEAD as f32 * settings.gate_spacing {
+    // Spawn until exactly GATES_AHEAD gates are in front of the player.
+    let ahead = manager.live.iter().filter(|(z, _)| *z < pz).count();
+    let to_spawn = GATES_AHEAD.saturating_sub(ahead);
+    for _ in 0..to_spawn {
         let z = manager.next_z;
         let (question, correct, distractor, word_index) = scheduler.pick();
         let correct_is_left = scheduler.rng.gen_bool(0.5);
@@ -822,13 +905,12 @@ fn manage_gates_system(
         };
         let entities = spawn_gate(
             &mut commands,
-            &mut meshes,
-            &mut materials,
+            &gate_assets,
             text_mat.0.clone(),
             z,
-            question,
-            answer_l,
-            answer_r,
+            &question,
+            &answer_l,
+            &answer_r,
             correct_is_left,
             word_index,
             settings.gate_scale,
@@ -837,12 +919,16 @@ fn manage_gates_system(
         manager.next_z -= settings.gate_spacing;
     }
 
-    while let Some((gate_z, entities)) = manager.live.front() {
-        if *gate_z > pz + settings.gate_spacing {
-            for &e in entities {
+    // Despawn oldest gates until at most GATES_BEHIND remain behind the player.
+    loop {
+        let behind = manager.live.iter().filter(|(z, _)| *z > pz).count();
+        if behind <= GATES_BEHIND {
+            break;
+        }
+        if let Some((_, entities)) = manager.live.pop_front() {
+            for &e in &entities {
                 commands.entity(e).despawn();
             }
-            manager.live.pop_front();
         } else {
             break;
         }
