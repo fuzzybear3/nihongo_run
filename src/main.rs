@@ -2,6 +2,7 @@ mod sr;
 mod supabase;
 
 use bevy::anti_alias::smaa::{Smaa, SmaaPreset};
+use bevy::gltf::GltfAssetLabel;
 use bevy::render::alpha::AlphaMode;
 use bevy::render::view::screenshot::{Screenshot, save_to_disk};
 use bevy::tasks::{IoTaskPool, Task};
@@ -61,6 +62,10 @@ struct CameraSettings {
     gate_scale: f32,
     player_speed: f32,
     gate_spacing: f32,
+    player_scale: f32,
+    anim_speed: f32,
+    cam_side: f32,
+    player_y: f32,
 }
 
 const TILE_LENGTH: f32 = 20.0;
@@ -166,6 +171,10 @@ struct WordsTask(Task<Vec<(String, String)>>);
 #[derive(Resource)]
 struct TextMat(Handle<StandardMaterial>);
 
+/// Holds the animation clip loaded from the player GLTF.
+#[derive(Resource)]
+struct PlayerAnimClip(Handle<AnimationClip>);
+
 /// Pre-created gate geometry and materials — reused for every gate spawn.
 #[derive(Resource)]
 struct GateAssets {
@@ -227,6 +236,10 @@ fn main() {
         gate_scale: 0.65,
         player_speed: 25.0,
         gate_spacing: 125.0,
+        player_scale: 1.0,
+        anim_speed: 1.0,
+        cam_side: 0.0,
+        player_y: 0.0,
     })
     .add_systems(Startup, setup)
     // Always-running systems (both states)
@@ -235,6 +248,10 @@ fn main() {
         (
             poll_words_system,
             check_loading_system.run_if(in_state(GameState::Loading)),
+            setup_player_animation,
+            update_anim_speed,
+            apply_player_scale,
+            fix_player_material,
             #[cfg(not(target_arch = "wasm32"))]
             screenshot_system,
         ),
@@ -344,6 +361,7 @@ fn setup(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
+    asset_server: Res<AssetServer>,
 ) {
     // Shared material for all Text3d entities
     let text_mat = materials.add(StandardMaterial {
@@ -424,13 +442,13 @@ fn setup(
         }),
     });
 
-    // Player
+    // Player — load from GLTF
+    let anim_clip: Handle<AnimationClip> =
+        asset_server.load(GltfAssetLabel::Animation(0).from_asset("test.glb"));
+    commands.insert_resource(PlayerAnimClip(anim_clip));
+
     commands.spawn((
-        Mesh3d(meshes.add(Capsule3d::new(0.28, 0.7))),
-        MeshMaterial3d(materials.add(StandardMaterial {
-            base_color: Color::srgb(0.2, 0.3, 0.7),
-            ..default()
-        })),
+        SceneRoot(asset_server.load(GltfAssetLabel::Scene(0).from_asset("test.glb"))),
         Transform::from_xyz(0.0, 0.9, 0.0),
         Player {
             lateral: 0.0,
@@ -701,6 +719,74 @@ fn move_system(
     };
     transform.translation.z -= speed * dt;
     transform.translation.x = player.lateral;
+    let lateral_vel = (player.target_lateral - player.lateral) * smoothing;
+    let yaw = f32::atan2(-lateral_vel, speed);
+    transform.rotation = Quat::from_rotation_y(std::f32::consts::PI + yaw);
+}
+
+
+fn setup_player_animation(
+    mut commands: Commands,
+    mut anim_players: Query<(Entity, &mut AnimationPlayer), Added<AnimationPlayer>>,
+    mut graphs: ResMut<Assets<AnimationGraph>>,
+    clip: Option<Res<PlayerAnimClip>>,
+) {
+    let Some(clip) = clip else { return };
+    for (entity, mut player) in anim_players.iter_mut() {
+        let (graph, node) = AnimationGraph::from_clip(clip.0.clone());
+        let graph_handle = graphs.add(graph);
+        commands
+            .entity(entity)
+            .insert(AnimationGraphHandle(graph_handle));
+        player.play(node).repeat();
+    }
+}
+
+
+fn update_anim_speed(
+    settings: Res<CameraSettings>,
+    mut anim_players: Query<&mut AnimationPlayer>,
+) {
+    for mut player in anim_players.iter_mut() {
+        for (_, anim) in player.playing_animations_mut() {
+            anim.set_speed(settings.anim_speed);
+        }
+    }
+}
+
+fn apply_player_scale(
+    settings: Res<CameraSettings>,
+    mut player_q: Query<&mut Transform, With<Player>>,
+) {
+    if let Ok(mut transform) = player_q.single_mut() {
+        transform.scale = Vec3::splat(settings.player_scale);
+        transform.translation.y = settings.player_y;
+    }
+}
+
+fn fix_player_material(
+    player_q: Query<Entity, With<Player>>,
+    children_q: Query<&Children>,
+    mesh_mat_q: Query<&MeshMaterial3d<StandardMaterial>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut done: Local<bool>,
+) {
+    if *done { return; }
+    let Ok(player_entity) = player_q.single() else { return };
+    let mut stack = vec![player_entity];
+    let mut fixed = false;
+    while let Some(entity) = stack.pop() {
+        if let Ok(handle) = mesh_mat_q.get(entity) {
+            if let Some(mat) = materials.get_mut(handle.id()) {
+                mat.alpha_mode = AlphaMode::Opaque;
+                fixed = true;
+            }
+        }
+        if let Ok(children) = children_q.get(entity) {
+            stack.extend(children.iter());
+        }
+    }
+    if fixed { *done = true; }
 }
 
 fn camera_follow_system(
@@ -715,7 +801,7 @@ fn camera_follow_system(
     let Ok(mut cam_t) = cam_q.single_mut() else {
         return;
     };
-    let offset = Vec3::new(0.0, settings.height, settings.distance);
+    let offset = Vec3::new(settings.cam_side, settings.height, settings.distance);
     let ideal = player_t.translation + offset;
     cam_t.translation = cam_t
         .translation
@@ -734,6 +820,10 @@ fn camera_settings_ui(mut contexts: EguiContexts, mut settings: ResMut<CameraSet
             ui.add(egui::Slider::new(&mut settings.gate_scale, 0.3..=3.0).text("gate size"));
             ui.add(egui::Slider::new(&mut settings.player_speed, 1.0..=50.0).text("speed"));
             ui.add(egui::Slider::new(&mut settings.gate_spacing, 10.0..=200.0).text("gate spacing"));
+            ui.add(egui::Slider::new(&mut settings.player_scale, 0.1..=5.0).text("player size"));
+            ui.add(egui::Slider::new(&mut settings.anim_speed, 0.1..=3.0).text("anim speed"));
+            ui.add(egui::Slider::new(&mut settings.cam_side, -20.0..=20.0).text("cam side"));
+            ui.add(egui::Slider::new(&mut settings.player_y, -5.0..=5.0).text("player y"));
         });
     Ok(())
 }
