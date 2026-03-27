@@ -53,6 +53,32 @@ const DASH_SPEED_MULT: f32 = 6.8;
 const SWIPE_UP_VELOCITY: f32 = 800.0; // pixels per second upward
 const CAM_OFFSET_DEFAULT: Vec3 = Vec3::new(0.0, 2.5, 30.0);
 
+const HIRAGANA_DECK: &[(&str, &str)] = &[
+    ("あ", "a"), ("い", "i"), ("う", "u"), ("え", "e"), ("お", "o"),
+    ("か", "ka"), ("き", "ki"), ("く", "ku"), ("け", "ke"), ("こ", "ko"),
+    ("さ", "sa"), ("し", "shi"), ("す", "su"), ("せ", "se"), ("そ", "so"),
+    ("た", "ta"), ("ち", "chi"), ("つ", "tsu"), ("て", "te"), ("と", "to"),
+    ("な", "na"), ("に", "ni"), ("ぬ", "nu"), ("ね", "ne"), ("の", "no"),
+    ("は", "ha"), ("ひ", "hi"), ("ふ", "fu"), ("へ", "he"), ("ほ", "ho"),
+    ("ま", "ma"), ("み", "mi"), ("む", "mu"), ("め", "me"), ("も", "mo"),
+    ("や", "ya"), ("ゆ", "yu"), ("よ", "yo"),
+    ("ら", "ra"), ("り", "ri"), ("る", "ru"), ("れ", "re"), ("ろ", "ro"),
+    ("わ", "wa"), ("を", "wo"), ("ん", "n"),
+];
+
+const KATAKANA_DECK: &[(&str, &str)] = &[
+    ("ア", "a"), ("イ", "i"), ("ウ", "u"), ("エ", "e"), ("オ", "o"),
+    ("カ", "ka"), ("キ", "ki"), ("ク", "ku"), ("ケ", "ke"), ("コ", "ko"),
+    ("サ", "sa"), ("シ", "shi"), ("ス", "su"), ("セ", "se"), ("ソ", "so"),
+    ("タ", "ta"), ("チ", "chi"), ("ツ", "tsu"), ("テ", "te"), ("ト", "to"),
+    ("ナ", "na"), ("ニ", "ni"), ("ヌ", "nu"), ("ネ", "ne"), ("ノ", "no"),
+    ("ハ", "ha"), ("ヒ", "hi"), ("フ", "fu"), ("ヘ", "he"), ("ホ", "ho"),
+    ("マ", "ma"), ("ミ", "mi"), ("ム", "mu"), ("メ", "me"), ("モ", "mo"),
+    ("ヤ", "ya"), ("ユ", "yu"), ("ヨ", "yo"),
+    ("ラ", "ra"), ("リ", "ri"), ("ル", "ru"), ("レ", "re"), ("ロ", "ro"),
+    ("ワ", "wa"), ("ヲ", "wo"), ("ン", "n"),
+];
+
 #[derive(Resource)]
 struct CameraSettings {
     height: f32,
@@ -187,11 +213,31 @@ struct GateAssets {
     sign_mat_blue: Handle<StandardMaterial>,
 }
 
+// ─── Deck selection & menu markers ───────────────────────────────────────────
+
+#[derive(Resource, Default, Debug, Clone, PartialEq, Eq)]
+enum DeckChoice {
+    #[default]
+    Hiragana,
+    Katakana,
+    N5Vocab,
+}
+
+#[derive(Component)]
+struct MenuRoot;
+
+#[derive(Component)]
+struct DeckButton(DeckChoice);
+
+#[derive(Component)]
+struct StartButton;
+
 // ─── Game state ───────────────────────────────────────────────────────────────
 
 #[derive(States, Default, Debug, Clone, PartialEq, Eq, Hash)]
 enum GameState {
     #[default]
+    Menu,
     Loading,
     Playing,
 }
@@ -242,11 +288,10 @@ fn main() {
         player_y: 0.0,
     })
     .add_systems(Startup, setup)
-    // Always-running systems (both states)
+    // Always-running systems (all states)
     .add_systems(
         Update,
         (
-            poll_words_system,
             check_loading_system.run_if(in_state(GameState::Loading)),
             setup_player_animation,
             update_anim_speed,
@@ -284,8 +329,21 @@ fn main() {
             camera_settings_ui.run_if(in_state(GameState::Playing)),
             flash_overlay_ui.run_if(in_state(GameState::Playing)),
             sr_stats_ui.run_if(in_state(GameState::Playing)),
+            menu_button_ui.run_if(in_state(GameState::Playing)),
         ),
     );
+
+    app.init_resource::<DeckChoice>()
+        .add_systems(OnEnter(GameState::Menu), spawn_menu_system)
+        .add_systems(OnExit(GameState::Menu), cleanup_menu_system)
+        .add_systems(OnExit(GameState::Playing), exit_playing_system)
+        .add_systems(OnEnter(GameState::Loading), enter_loading_system)
+        .add_systems(Update, poll_words_system.run_if(in_state(GameState::Loading)))
+        .add_systems(
+            Update,
+            (menu_interaction_system, update_deck_button_visuals_system)
+                .run_if(in_state(GameState::Menu)),
+        );
 
     #[cfg(not(target_arch = "wasm32"))]
     if std::env::args().any(|a| a == "--screenshot") {
@@ -355,6 +413,291 @@ fn loading_ui(mut contexts: EguiContexts) -> Result {
     Ok(())
 }
 
+fn menu_button_ui(
+    mut contexts: EguiContexts,
+    mut next_state: ResMut<NextState<GameState>>,
+) -> Result {
+    let ctx = contexts.ctx_mut()?;
+    egui::Area::new(egui::Id::new("menu_btn"))
+        .anchor(egui::Align2::RIGHT_TOP, [-8.0, 8.0])
+        .order(egui::Order::Foreground)
+        .show(ctx, |ui| {
+            if ui.button("≡ Menu").clicked() {
+                next_state.set(GameState::Menu);
+            }
+        });
+    Ok(())
+}
+
+fn exit_playing_system(
+    mut commands: Commands,
+    tile_q: Query<Entity, With<Tile>>,
+    mut tile_manager: ResMut<TileManager>,
+    mut gate_manager: ResMut<GateManager>,
+    mut scheduler: ResMut<Scheduler>,
+    mut player_q: Query<(&mut Player, &mut Transform), Without<CameraMarker>>,
+    mut cam_q: Query<&mut Transform, With<CameraMarker>>,
+    mut drag: ResMut<DragState>,
+    mut flash: ResMut<FlashState>,
+) {
+    for e in tile_q.iter() {
+        commands.entity(e).despawn();
+    }
+    for (_, entities) in gate_manager.live.drain(..) {
+        for e in entities {
+            commands.entity(e).despawn();
+        }
+    }
+    *tile_manager = TileManager {
+        frontier_z: TILE_LENGTH / 2.0,
+        spawned: std::collections::VecDeque::new(),
+        count: 0,
+    };
+    *gate_manager = GateManager {
+        next_z: -50.0,
+        live: std::collections::VecDeque::new(),
+    };
+    *scheduler = Scheduler::new();
+    if let Ok((mut player, mut transform)) = player_q.single_mut() {
+        player.lateral = 0.0;
+        player.target_lateral = 0.0;
+        player.dashing = false;
+        transform.translation = Vec3::new(0.0, 0.9, 0.0);
+        transform.rotation = Quat::from_rotation_y(std::f32::consts::PI);
+    }
+    if let Ok(mut cam_t) = cam_q.single_mut() {
+        cam_t.translation = CAM_OFFSET_DEFAULT;
+        cam_t.look_at(Vec3::ZERO, Vec3::Y);
+    }
+    *drag = DragState::default();
+    *flash = FlashState::default();
+}
+
+// ─── Loading entry ────────────────────────────────────────────────────────────
+
+fn enter_loading_system(
+    mut commands: Commands,
+    deck: Res<DeckChoice>,
+    mut scheduler: ResMut<Scheduler>,
+) {
+    match *deck {
+        DeckChoice::Hiragana => {
+            let words = HIRAGANA_DECK
+                .iter()
+                .map(|&(a, q)| (a.to_string(), q.to_string()))
+                .collect();
+            scheduler.load_words(words);
+        }
+        DeckChoice::Katakana => {
+            let words = KATAKANA_DECK
+                .iter()
+                .map(|&(a, q)| (a.to_string(), q.to_string()))
+                .collect();
+            scheduler.load_words(words);
+        }
+        DeckChoice::N5Vocab => {
+            let task = IoTaskPool::get().spawn(supabase::fetch_words());
+            commands.insert_resource(WordsTask(task));
+        }
+    }
+}
+
+// ─── Menu ─────────────────────────────────────────────────────────────────────
+
+const COLOR_DECK_SELECTED: Color = Color::srgb(0.9, 0.72, 0.08);
+const COLOR_DECK_UNSELECTED: Color = Color::srgba(1.0, 1.0, 1.0, 0.15);
+
+fn spawn_menu_system(mut commands: Commands) {
+    commands
+        .spawn((
+            Node {
+                width: Val::Percent(100.0),
+                height: Val::Percent(100.0),
+                flex_direction: FlexDirection::Column,
+                align_items: AlignItems::Center,
+                justify_content: JustifyContent::Center,
+                row_gap: Val::Px(24.0),
+                ..default()
+            },
+            BackgroundColor(Color::srgba(0.0, 0.0, 0.0, 0.3)),
+            MenuRoot,
+        ))
+        .with_children(|root| {
+            // ── Title ──
+            root.spawn((
+                Text::new("NIHONGO RUN"),
+                TextFont { font_size: 48.0, ..default() },
+                TextColor(Color::WHITE),
+            ));
+
+            // ── Mode card ──
+            root.spawn((
+                Node {
+                    flex_direction: FlexDirection::Column,
+                    align_items: AlignItems::Center,
+                    padding: UiRect::all(Val::Px(16.0)),
+                    row_gap: Val::Px(10.0),
+                    border_radius: BorderRadius::all(Val::Px(12.0)),
+                    ..default()
+                },
+                BackgroundColor(Color::srgba(0.0, 0.0, 0.0, 0.55)),
+            ))
+            .with_children(|card| {
+                card.spawn((
+                    Text::new("MODE"),
+                    TextFont { font_size: 14.0, ..default() },
+                    TextColor(Color::srgba(1.0, 1.0, 1.0, 0.6)),
+                ));
+                card.spawn((
+                    Node {
+                        padding: UiRect {
+                            left: Val::Px(20.0),
+                            right: Val::Px(20.0),
+                            top: Val::Px(8.0),
+                            bottom: Val::Px(8.0),
+                        },
+                        align_items: AlignItems::Center,
+                        justify_content: JustifyContent::Center,
+                        border_radius: BorderRadius::all(Val::Px(8.0)),
+                        ..default()
+                    },
+                    BackgroundColor(Color::srgba(1.0, 1.0, 1.0, 0.15)),
+                ))
+                .with_children(|badge| {
+                    badge.spawn((
+                        Text::new("Endless Run"),
+                        TextFont { font_size: 18.0, ..default() },
+                        TextColor(Color::WHITE),
+                    ));
+                });
+            });
+
+            // ── Deck card ──
+            root.spawn((
+                Node {
+                    flex_direction: FlexDirection::Column,
+                    align_items: AlignItems::Center,
+                    padding: UiRect::all(Val::Px(16.0)),
+                    row_gap: Val::Px(10.0),
+                    border_radius: BorderRadius::all(Val::Px(12.0)),
+                    ..default()
+                },
+                BackgroundColor(Color::srgba(0.0, 0.0, 0.0, 0.55)),
+            ))
+            .with_children(|card| {
+                card.spawn((
+                    Text::new("DECK"),
+                    TextFont { font_size: 14.0, ..default() },
+                    TextColor(Color::srgba(1.0, 1.0, 1.0, 0.6)),
+                ));
+                // Row of deck buttons
+                card.spawn(Node {
+                    flex_direction: FlexDirection::Row,
+                    column_gap: Val::Px(12.0),
+                    ..default()
+                })
+                .with_children(|row| {
+                    for (choice, label, selected) in [
+                        (DeckChoice::Hiragana, "Hiragana", true),
+                        (DeckChoice::Katakana, "Katakana", false),
+                        (DeckChoice::N5Vocab, "N5 Vocab", false),
+                    ] {
+                        row.spawn((
+                            Button,
+                            DeckButton(choice),
+                            Node {
+                                padding: UiRect {
+                                    left: Val::Px(20.0),
+                                    right: Val::Px(20.0),
+                                    top: Val::Px(10.0),
+                                    bottom: Val::Px(10.0),
+                                },
+                                align_items: AlignItems::Center,
+                                justify_content: JustifyContent::Center,
+                                border_radius: BorderRadius::all(Val::Px(8.0)),
+                                ..default()
+                            },
+                            BackgroundColor(if selected {
+                                COLOR_DECK_SELECTED
+                            } else {
+                                COLOR_DECK_UNSELECTED
+                            }),
+                        ))
+                        .with_children(|btn| {
+                            btn.spawn((
+                                Text::new(label),
+                                TextFont { font_size: 18.0, ..default() },
+                                TextColor(Color::WHITE),
+                            ));
+                        });
+                    }
+                });
+            });
+
+            // ── START button ──
+            root.spawn((
+                Button,
+                StartButton,
+                Node {
+                    width: Val::Px(200.0),
+                    height: Val::Px(56.0),
+                    align_items: AlignItems::Center,
+                    justify_content: JustifyContent::Center,
+                    border_radius: BorderRadius::all(Val::Px(10.0)),
+                    ..default()
+                },
+                BackgroundColor(Color::srgb(0.85, 0.15, 0.05)),
+            ))
+            .with_children(|btn| {
+                btn.spawn((
+                    Text::new("START"),
+                    TextFont { font_size: 24.0, ..default() },
+                    TextColor(Color::WHITE),
+                ));
+            });
+        });
+}
+
+fn cleanup_menu_system(mut commands: Commands, q: Query<Entity, With<MenuRoot>>) {
+    for e in q.iter() {
+        commands.entity(e).despawn();
+    }
+}
+
+fn menu_interaction_system(
+    mut commands: Commands,
+    deck_q: Query<(&Interaction, &DeckButton), (Changed<Interaction>, With<Button>)>,
+    start_q: Query<&Interaction, (Changed<Interaction>, With<StartButton>, With<Button>)>,
+    mut next_state: ResMut<NextState<GameState>>,
+) {
+    for (interaction, deck_btn) in deck_q.iter() {
+        if *interaction == Interaction::Pressed {
+            commands.insert_resource(deck_btn.0.clone());
+        }
+    }
+    for interaction in start_q.iter() {
+        if *interaction == Interaction::Pressed {
+            next_state.set(GameState::Loading);
+        }
+    }
+}
+
+fn update_deck_button_visuals_system(
+    deck: Res<DeckChoice>,
+    mut btn_q: Query<(&DeckButton, &mut BackgroundColor)>,
+) {
+    if !deck.is_changed() {
+        return;
+    }
+    for (btn, mut color) in btn_q.iter_mut() {
+        *color = BackgroundColor(if btn.0 == *deck {
+            COLOR_DECK_SELECTED
+        } else {
+            COLOR_DECK_UNSELECTED
+        });
+    }
+}
+
 // ─── Startup ──────────────────────────────────────────────────────────────────
 
 fn setup(
@@ -374,10 +717,6 @@ fn setup(
     commands.insert_resource(TextMat(text_mat));
     commands.insert_resource(Scheduler::new());
     commands.insert_resource(FlashState::default());
-
-    // Kick off async fetch of words from Supabase.
-    let task = IoTaskPool::get().spawn(supabase::fetch_words());
-    commands.insert_resource(WordsTask(task));
 
     // Lighting
     commands.insert_resource(GlobalAmbientLight {

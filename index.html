@@ -35,6 +35,8 @@
   <!-- trunk replaces this link with the compiled WASM + JS glue -->
   <link data-trunk rel="rust" data-cargo-features="webgl2"
         data-wasm-opt-params="--enable-bulk-memory --enable-nontrapping-float-to-int" />
+  <!-- copy the assets directory to dist so the asset server can find runtime files -->
+  <link data-trunk rel="copy-dir" href="assets" />
 </head>
 <body>
   <div id="loading">loading...</div>
