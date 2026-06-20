@@ -15,13 +15,13 @@ struct Row {
 /// Returns `(hiragana, display)` pairs where `display` is the kanji form
 /// when available, otherwise hiragana.
 /// Logs an error and returns an empty Vec on failure.
-pub async fn fetch_words() -> Vec<(String, String)> {
+pub async fn fetch_words(level: &'static str) -> Vec<(String, String)> {
     // On native, reqwest/hyper requires a Tokio runtime context.
     // async-compat::Compat provides one without needing a full Tokio app.
     #[cfg(not(target_arch = "wasm32"))]
-    let result = async_compat::Compat::new(fetch_inner()).await;
+    let result = async_compat::Compat::new(fetch_inner(level)).await;
     #[cfg(target_arch = "wasm32")]
-    let result = fetch_inner().await;
+    let result = fetch_inner(level).await;
 
     match result {
         Ok(words) => words,
@@ -32,9 +32,11 @@ pub async fn fetch_words() -> Vec<(String, String)> {
     }
 }
 
-async fn fetch_inner() -> Result<Vec<(String, String)>, reqwest::Error> {
+async fn fetch_inner(level: &str) -> Result<Vec<(String, String)>, reqwest::Error> {
     let rows: Vec<Row> = reqwest::Client::new()
-        .get(format!("{URL}/rest/v1/words?select=hiragana,kanji&jlpt_level=eq.N5&order=hiragana"))
+        .get(format!(
+            "{URL}/rest/v1/words?select=hiragana,kanji&jlpt_level=eq.{level}&order=hiragana"
+        ))
         .header("apikey", ANON_KEY)
         .header("Authorization", format!("Bearer {ANON_KEY}"))
         .send()

@@ -269,6 +269,7 @@ enum DeckChoice {
     Dakuten,
     Numbers,
     N5Vocab,
+    N4Vocab,
 }
 
 #[derive(Component)]
@@ -541,9 +542,10 @@ fn enter_loading_system(
         DeckChoice::Katakana => KATAKANA_DECK,
         DeckChoice::Dakuten => DAKUTEN_DECK,
         DeckChoice::Numbers => NUMBERS_DECK,
-        DeckChoice::N5Vocab => {
-            // N5 vocab is fetched asynchronously from Supabase.
-            let task = IoTaskPool::get().spawn(supabase::fetch_words());
+        DeckChoice::N5Vocab | DeckChoice::N4Vocab => {
+            // Vocab decks are fetched asynchronously from Supabase by level.
+            let level = if *deck == DeckChoice::N4Vocab { "N4" } else { "N5" };
+            let task = IoTaskPool::get().spawn(supabase::fetch_words(level));
             commands.insert_resource(WordsTask(task));
             return;
         }
@@ -673,6 +675,7 @@ fn spawn_menu_system(mut commands: Commands) {
                         (DeckChoice::Dakuten, "Dakuten", false),
                         (DeckChoice::Numbers, "Numbers", false),
                         (DeckChoice::N5Vocab, "N5 Vocab", false),
+                        (DeckChoice::N4Vocab, "N4 Vocab", false),
                     ] {
                         row.spawn((
                             Button,
@@ -1750,6 +1753,8 @@ fn auto_start_for_screenshot(
     let has = |s: &str| args.iter().any(|a| a == s);
     if has("--n5") {
         *deck = DeckChoice::N5Vocab;
+    } else if has("--n4") {
+        *deck = DeckChoice::N4Vocab;
     } else if has("--katakana") {
         *deck = DeckChoice::Katakana;
     } else if has("--dakuten") {
