@@ -1,18 +1,17 @@
 mod sr;
 mod supabase;
+mod textbake;
 
 use bevy::anti_alias::smaa::{Smaa, SmaaPreset};
 use bevy::gltf::GltfAssetLabel;
-use bevy::render::alpha::AlphaMode;
 use bevy::render::view::screenshot::{Screenshot, save_to_disk};
 use bevy::tasks::{IoTaskPool, Task};
 use bevy::{asset::AssetMetaCheck, prelude::*};
 use bevy_egui::{EguiContexts, EguiPlugin, EguiPrimaryContextPass, egui};
-use bevy_rich_text3d::{LoadFonts, Text3d, Text3dPlugin, Text3dStyling, TextAtlas};
 use rand::Rng;
 use sr::Scheduler;
 use std::collections::VecDeque;
-use std::num::NonZero;
+use textbake::{TextBaker, TextKind};
 
 // ─── Window constants ─────────────────────────────────────────────────────────
 
@@ -52,6 +51,9 @@ const MAX_LATERAL: f32 = 2.0;
 const DASH_SPEED_MULT: f32 = 6.8;
 const SWIPE_UP_VELOCITY: f32 = 800.0; // pixels per second upward
 const CAM_OFFSET_DEFAULT: Vec3 = Vec3::new(0.0, 2.5, 30.0);
+/// Shared horizon color — used for the clear color and distance fog so the track
+/// fades seamlessly into the sky.
+const SKY_COLOR: Color = Color::srgb(0.48, 0.64, 0.82);
 
 const HIRAGANA_DECK: &[(&str, &str)] = &[
     ("あ", "a"), ("い", "i"), ("う", "u"), ("え", "e"), ("お", "o"),
@@ -77,6 +79,22 @@ const KATAKANA_DECK: &[(&str, &str)] = &[
     ("ヤ", "ya"), ("ユ", "yu"), ("ヨ", "yo"),
     ("ラ", "ra"), ("リ", "ri"), ("ル", "ru"), ("レ", "re"), ("ロ", "ro"),
     ("ワ", "wa"), ("ヲ", "wo"), ("ン", "n"),
+];
+
+// Voiced/semi-voiced hiragana. Duplicate-reading kana (ぢ/づ) are omitted so a
+// distractor can never be an equally-correct answer.
+const DAKUTEN_DECK: &[(&str, &str)] = &[
+    ("が", "ga"), ("ぎ", "gi"), ("ぐ", "gu"), ("げ", "ge"), ("ご", "go"),
+    ("ざ", "za"), ("じ", "ji"), ("ず", "zu"), ("ぜ", "ze"), ("ぞ", "zo"),
+    ("だ", "da"), ("で", "de"), ("ど", "do"),
+    ("ば", "ba"), ("び", "bi"), ("ぶ", "bu"), ("べ", "be"), ("ぼ", "bo"),
+    ("ぱ", "pa"), ("ぴ", "pi"), ("ぷ", "pu"), ("ぺ", "pe"), ("ぽ", "po"),
+];
+
+// Numbers 1–10: prompt is the digit, answers are the hiragana readings.
+const NUMBERS_DECK: &[(&str, &str)] = &[
+    ("いち", "1"), ("に", "2"), ("さん", "3"), ("よん", "4"), ("ご", "5"),
+    ("ろく", "6"), ("なな", "7"), ("はち", "8"), ("きゅう", "9"), ("じゅう", "10"),
 ];
 
 #[derive(Resource)]
@@ -120,6 +138,11 @@ struct CameraMarker;
 #[derive(Component)]
 struct Tile;
 
+/// Large grass plane that follows the player so the track sits in a landscape
+/// instead of floating in the sky.
+#[derive(Component)]
+struct GroundPlane;
+
 /// Rotates around Y each frame to face the camera.
 #[derive(Component)]
 struct Billboard;
@@ -158,11 +181,36 @@ struct FlashState {
     correct: bool,
 }
 
+/// Player-facing score: total correct answers and current/best streak.
+#[derive(Resource, Default)]
+struct Score {
+    correct: u32,
+    streak: u32,
+    best_streak: u32,
+}
+
+/// Tags every in-game (Playing-state) UI root so they can be despawned together.
+#[derive(Component)]
+struct PlayingUi;
+#[derive(Component)]
+struct ScoreValue;
+#[derive(Component)]
+struct StreakValue;
+#[derive(Component)]
+struct FlashOverlay;
+#[derive(Component)]
+struct InGameMenuButton;
+/// The "Loading words…" overlay (Loading state).
+#[derive(Component)]
+struct LoadingUi;
+
 #[derive(Resource)]
 struct TileAssets {
     mesh: Handle<Mesh>,
     mat_a: Handle<StandardMaterial>,
     mat_b: Handle<StandardMaterial>,
+    rail_mesh: Handle<Mesh>,
+    rail_mat: Handle<StandardMaterial>,
 }
 
 #[derive(Resource)]
@@ -193,10 +241,6 @@ struct DragState {
 #[derive(Resource)]
 struct WordsTask(Task<Vec<(String, String)>>);
 
-/// Shared material for all Text3d entities.
-#[derive(Resource)]
-struct TextMat(Handle<StandardMaterial>);
-
 /// Holds the animation clip loaded from the player GLTF.
 #[derive(Resource)]
 struct PlayerAnimClip(Handle<AnimationClip>);
@@ -207,6 +251,8 @@ struct GateAssets {
     post_mesh: Handle<Mesh>,
     crossbeam_mesh: Handle<Mesh>,
     sign_mesh: Handle<Mesh>,
+    /// Shared 1×1 quad (XY plane) used for all baked-text labels.
+    text_quad: Handle<Mesh>,
     post_mat: Handle<StandardMaterial>,
     crossbeam_mat: Handle<StandardMaterial>,
     sign_mat_yellow: Handle<StandardMaterial>,
@@ -220,6 +266,8 @@ enum DeckChoice {
     #[default]
     Hiragana,
     Katakana,
+    Dakuten,
+    Numbers,
     N5Vocab,
 }
 
@@ -264,15 +312,10 @@ fn main() {
                 ..default()
             }),
     )
-    // Insert LoadFonts before the plugin so init_resource keeps our value
-    .insert_resource(LoadFonts {
-        font_embedded: vec![include_bytes!("../assets/fonts/TakaoPGothic.ttf")],
-        ..default()
-    })
-    .add_plugins(Text3dPlugin::default())
     .add_plugins(EguiPlugin::default())
+    .insert_resource(TextBaker::new())
     .init_state::<GameState>()
-    .insert_resource(ClearColor(Color::srgb(0.4, 0.65, 0.85)))
+    .insert_resource(ClearColor(SKY_COLOR))
     .insert_resource(DragState::default())
     .insert_resource(CameraSettings {
         height: 2.5,
@@ -297,6 +340,7 @@ fn main() {
             update_anim_speed,
             apply_player_scale,
             fix_player_material,
+            follow_ground_system,
             #[cfg(not(target_arch = "wasm32"))]
             screenshot_system,
         ),
@@ -312,6 +356,9 @@ fn main() {
             manage_tiles_system,
             manage_gates_system,
             gate_check_system,
+            update_score_hud,
+            update_flash_overlay,
+            ingame_menu_button_system,
             apply_fov_system,
             billboard_system,
             slide_signs_system,
@@ -325,19 +372,20 @@ fn main() {
         EguiPrimaryContextPass,
         (
             setup_egui_fonts,
-            loading_ui.run_if(in_state(GameState::Loading)),
+            // Dev-only panels remain on egui (immediate-mode is ideal for these).
             camera_settings_ui.run_if(in_state(GameState::Playing)),
-            flash_overlay_ui.run_if(in_state(GameState::Playing)),
             sr_stats_ui.run_if(in_state(GameState::Playing)),
-            menu_button_ui.run_if(in_state(GameState::Playing)),
         ),
     );
 
     app.init_resource::<DeckChoice>()
+        .init_resource::<Score>()
         .add_systems(OnEnter(GameState::Menu), spawn_menu_system)
         .add_systems(OnExit(GameState::Menu), cleanup_menu_system)
-        .add_systems(OnExit(GameState::Playing), exit_playing_system)
-        .add_systems(OnEnter(GameState::Loading), enter_loading_system)
+        .add_systems(OnExit(GameState::Playing), (exit_playing_system, cleanup_playing_ui))
+        .add_systems(OnEnter(GameState::Playing), (prewarm_text_system, spawn_playing_ui))
+        .add_systems(OnEnter(GameState::Loading), (enter_loading_system, spawn_loading_ui))
+        .add_systems(OnExit(GameState::Loading), cleanup_loading_ui)
         .add_systems(Update, poll_words_system.run_if(in_state(GameState::Loading)))
         .add_systems(
             Update,
@@ -347,6 +395,10 @@ fn main() {
 
     #[cfg(not(target_arch = "wasm32"))]
     if std::env::args().any(|a| a == "--screenshot") {
+        // `--play` drops straight into gameplay; otherwise the menu is captured.
+        if std::env::args().any(|a| a == "--play") {
+            app.add_systems(Startup, auto_start_for_screenshot);
+        }
         app.add_systems(Update, auto_screenshot_system);
     }
 
@@ -401,32 +453,36 @@ fn check_loading_system(
     }
 }
 
-fn loading_ui(mut contexts: EguiContexts) -> Result {
-    let ctx = contexts.ctx_mut()?;
-    egui::CentralPanel::default()
-        .frame(egui::Frame::NONE.fill(egui::Color32::from_black_alpha(180)))
-        .show(ctx, |ui| {
-            ui.centered_and_justified(|ui| {
-                ui.heading("Loading words...");
-            });
+/// Native loading overlay shown while the deck is being fetched/built.
+fn spawn_loading_ui(mut commands: Commands) {
+    commands
+        .spawn((
+            Node {
+                position_type: PositionType::Absolute,
+                top: Val::Px(0.0),
+                left: Val::Px(0.0),
+                width: Val::Percent(100.0),
+                height: Val::Percent(100.0),
+                align_items: AlignItems::Center,
+                justify_content: JustifyContent::Center,
+                ..default()
+            },
+            BackgroundColor(Color::srgba(0.0, 0.0, 0.0, 0.7)),
+            LoadingUi,
+        ))
+        .with_children(|p| {
+            p.spawn((
+                Text::new("Loading words…"),
+                TextFont { font_size: FontSize::Px(28.0), ..default() },
+                TextColor(Color::WHITE),
+            ));
         });
-    Ok(())
 }
 
-fn menu_button_ui(
-    mut contexts: EguiContexts,
-    mut next_state: ResMut<NextState<GameState>>,
-) -> Result {
-    let ctx = contexts.ctx_mut()?;
-    egui::Area::new(egui::Id::new("menu_btn"))
-        .anchor(egui::Align2::RIGHT_TOP, [-8.0, 8.0])
-        .order(egui::Order::Foreground)
-        .show(ctx, |ui| {
-            if ui.button("≡ Menu").clicked() {
-                next_state.set(GameState::Menu);
-            }
-        });
-    Ok(())
+fn cleanup_loading_ui(mut commands: Commands, q: Query<Entity, With<LoadingUi>>) {
+    for e in q.iter() {
+        commands.entity(e).despawn();
+    }
 }
 
 fn exit_playing_system(
@@ -480,26 +536,23 @@ fn enter_loading_system(
     deck: Res<DeckChoice>,
     mut scheduler: ResMut<Scheduler>,
 ) {
-    match *deck {
-        DeckChoice::Hiragana => {
-            let words = HIRAGANA_DECK
-                .iter()
-                .map(|&(a, q)| (a.to_string(), q.to_string()))
-                .collect();
-            scheduler.load_words(words);
-        }
-        DeckChoice::Katakana => {
-            let words = KATAKANA_DECK
-                .iter()
-                .map(|&(a, q)| (a.to_string(), q.to_string()))
-                .collect();
-            scheduler.load_words(words);
-        }
+    let local: &[(&str, &str)] = match *deck {
+        DeckChoice::Hiragana => HIRAGANA_DECK,
+        DeckChoice::Katakana => KATAKANA_DECK,
+        DeckChoice::Dakuten => DAKUTEN_DECK,
+        DeckChoice::Numbers => NUMBERS_DECK,
         DeckChoice::N5Vocab => {
+            // N5 vocab is fetched asynchronously from Supabase.
             let task = IoTaskPool::get().spawn(supabase::fetch_words());
             commands.insert_resource(WordsTask(task));
+            return;
         }
-    }
+    };
+    let words = local
+        .iter()
+        .map(|&(a, q)| (a.to_string(), q.to_string()))
+        .collect();
+    scheduler.load_words(words);
 }
 
 // ─── Menu ─────────────────────────────────────────────────────────────────────
@@ -519,16 +572,29 @@ fn spawn_menu_system(mut commands: Commands) {
                 row_gap: Val::Px(24.0),
                 ..default()
             },
-            BackgroundColor(Color::srgba(0.0, 0.0, 0.0, 0.3)),
+            BackgroundColor(Color::srgba(0.02, 0.03, 0.06, 0.55)),
             MenuRoot,
         ))
         .with_children(|root| {
             // ── Title ──
-            root.spawn((
-                Text::new("NIHONGO RUN"),
-                TextFont { font_size: 48.0, ..default() },
-                TextColor(Color::WHITE),
-            ));
+            root.spawn(Node {
+                flex_direction: FlexDirection::Column,
+                align_items: AlignItems::Center,
+                row_gap: Val::Px(2.0),
+                ..default()
+            })
+            .with_children(|t| {
+                t.spawn((
+                    Text::new("NIHONGO RUN"),
+                    TextFont { font_size: FontSize::Px(52.0), ..default() },
+                    TextColor(Color::srgb(1.0, 0.85, 0.3)),
+                ));
+                t.spawn((
+                    Text::new("learn kana while you run"),
+                    TextFont { font_size: FontSize::Px(14.0), ..default() },
+                    TextColor(Color::srgba(1.0, 1.0, 1.0, 0.65)),
+                ));
+            });
 
             // ── Mode card ──
             root.spawn((
@@ -545,7 +611,7 @@ fn spawn_menu_system(mut commands: Commands) {
             .with_children(|card| {
                 card.spawn((
                     Text::new("MODE"),
-                    TextFont { font_size: 14.0, ..default() },
+                    TextFont { font_size: FontSize::Px(14.0), ..default() },
                     TextColor(Color::srgba(1.0, 1.0, 1.0, 0.6)),
                 ));
                 card.spawn((
@@ -566,7 +632,7 @@ fn spawn_menu_system(mut commands: Commands) {
                 .with_children(|badge| {
                     badge.spawn((
                         Text::new("Endless Run"),
-                        TextFont { font_size: 18.0, ..default() },
+                        TextFont { font_size: FontSize::Px(18.0), ..default() },
                         TextColor(Color::WHITE),
                     ));
                 });
@@ -587,19 +653,25 @@ fn spawn_menu_system(mut commands: Commands) {
             .with_children(|card| {
                 card.spawn((
                     Text::new("DECK"),
-                    TextFont { font_size: 14.0, ..default() },
+                    TextFont { font_size: FontSize::Px(14.0), ..default() },
                     TextColor(Color::srgba(1.0, 1.0, 1.0, 0.6)),
                 ));
-                // Row of deck buttons
+                // Wrapping grid of deck buttons
                 card.spawn(Node {
+                    width: Val::Px(320.0),
                     flex_direction: FlexDirection::Row,
-                    column_gap: Val::Px(12.0),
+                    flex_wrap: FlexWrap::Wrap,
+                    justify_content: JustifyContent::Center,
+                    column_gap: Val::Px(10.0),
+                    row_gap: Val::Px(10.0),
                     ..default()
                 })
                 .with_children(|row| {
                     for (choice, label, selected) in [
                         (DeckChoice::Hiragana, "Hiragana", true),
                         (DeckChoice::Katakana, "Katakana", false),
+                        (DeckChoice::Dakuten, "Dakuten", false),
+                        (DeckChoice::Numbers, "Numbers", false),
                         (DeckChoice::N5Vocab, "N5 Vocab", false),
                     ] {
                         row.spawn((
@@ -626,7 +698,7 @@ fn spawn_menu_system(mut commands: Commands) {
                         .with_children(|btn| {
                             btn.spawn((
                                 Text::new(label),
-                                TextFont { font_size: 18.0, ..default() },
+                                TextFont { font_size: FontSize::Px(18.0), ..default() },
                                 TextColor(Color::WHITE),
                             ));
                         });
@@ -651,7 +723,7 @@ fn spawn_menu_system(mut commands: Commands) {
             .with_children(|btn| {
                 btn.spawn((
                     Text::new("START"),
-                    TextFont { font_size: 24.0, ..default() },
+                    TextFont { font_size: FontSize::Px(24.0), ..default() },
                     TextColor(Color::WHITE),
                 ));
             });
@@ -706,31 +778,26 @@ fn setup(
     mut materials: ResMut<Assets<StandardMaterial>>,
     asset_server: Res<AssetServer>,
 ) {
-    // Shared material for all Text3d entities
-    let text_mat = materials.add(StandardMaterial {
-        base_color_texture: Some(TextAtlas::DEFAULT_IMAGE.clone()),
-        alpha_mode: AlphaMode::Blend,
-        unlit: true,
-        cull_mode: None,
-        ..default()
-    });
-    commands.insert_resource(TextMat(text_mat));
     commands.insert_resource(Scheduler::new());
     commands.insert_resource(FlashState::default());
 
-    // Lighting
+    // Lighting — warm low sun casting shadows, with a cool sky fill so shadowed
+    // faces read as sky-lit rather than black.
     commands.insert_resource(GlobalAmbientLight {
-        color: Color::WHITE,
-        brightness: 400.0,
+        color: Color::srgb(0.62, 0.74, 0.95),
+        brightness: 280.0,
         ..default()
     });
     commands.spawn((
         DirectionalLight {
-            illuminance: 8_000.0,
-            shadows_enabled: false,
+            color: Color::srgb(1.0, 0.96, 0.86),
+            illuminance: 11_000.0,
+            // Shadows look great on desktop but are costly on mobile WebGL2
+            // (see NOTES.md), so keep them off for the wasm build.
+            shadow_maps_enabled: cfg!(not(target_arch = "wasm32")),
             ..default()
         },
-        Transform::from_rotation(Quat::from_euler(EulerRot::XYZ, -0.8, 0.3, 0.0)),
+        Transform::from_rotation(Quat::from_euler(EulerRot::XYZ, -0.85, 0.65, 0.0)),
     ));
 
     // Tile shared assets
@@ -749,7 +816,25 @@ fn setup(
         mesh: tile_mesh,
         mat_a,
         mat_b,
+        rail_mesh: meshes.add(Cuboid::new(0.3, 0.6, TILE_LENGTH)),
+        rail_mat: materials.add(StandardMaterial {
+            base_color: Color::srgb(0.40, 0.26, 0.15),
+            perceptual_roughness: 0.8,
+            ..default()
+        }),
     });
+
+    // Grass ground plane (follows the player) so the track sits in a landscape.
+    commands.spawn((
+        Mesh3d(meshes.add(Plane3d::default().mesh().size(600.0, 4000.0))),
+        MeshMaterial3d(materials.add(StandardMaterial {
+            base_color: Color::srgb(0.30, 0.45, 0.24),
+            perceptual_roughness: 1.0,
+            ..default()
+        })),
+        Transform::from_xyz(0.0, -0.30, 0.0),
+        GroundPlane,
+    ));
     commands.insert_resource(TileManager {
         frontier_z: TILE_LENGTH / 2.0,
         spawned: std::collections::VecDeque::new(),
@@ -759,6 +844,7 @@ fn setup(
         post_mesh: meshes.add(Cylinder::new(0.18, 4.8)),
         crossbeam_mesh: meshes.add(Cuboid::new(2.5, 2.5, 0.12)),
         sign_mesh: meshes.add(Cuboid::new(3.0, 2.5, 0.12)),
+        text_quad: meshes.add(Rectangle::new(1.0, 1.0)),
         post_mat: materials.add(StandardMaterial {
             base_color: Color::srgb(0.85, 0.15, 0.05),
             perceptual_roughness: 0.5,
@@ -787,7 +873,7 @@ fn setup(
     commands.insert_resource(PlayerAnimClip(anim_clip));
 
     commands.spawn((
-        SceneRoot(asset_server.load(GltfAssetLabel::Scene(0).from_asset("test.glb"))),
+        WorldAssetRoot(asset_server.load(GltfAssetLabel::Scene(0).from_asset("test.glb"))),
         Transform::from_xyz(0.0, 0.9, 0.0),
         Player {
             lateral: 0.0,
@@ -803,6 +889,11 @@ fn setup(
         Smaa {
             preset: SmaaPreset::Medium,
         },
+        DistanceFog {
+            color: SKY_COLOR,
+            falloff: FogFalloff::Linear { start: 95.0, end: 320.0 },
+            ..default()
+        },
         Transform::from_translation(CAM_OFFSET_DEFAULT).looking_at(Vec3::ZERO, Vec3::Y),
         CameraMarker,
     ));
@@ -813,12 +904,161 @@ fn setup(
     });
 }
 
+// ─── Text pre-warm ────────────────────────────────────────────────────────────
+
+/// Bakes every deck string up-front when entering Playing, so no glyph is
+/// rasterized/uploaded mid-run (fixes the mobile gate-freeze noted in NOTES.md).
+fn prewarm_text_system(
+    mut baker: ResMut<TextBaker>,
+    mut images: ResMut<Assets<Image>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    scheduler: Res<Scheduler>,
+) {
+    for (hiragana, display) in &scheduler.words {
+        baker.bake(&mut images, &mut materials, display, TextKind::Question);
+        baker.bake(&mut images, &mut materials, hiragana, TextKind::Answer);
+    }
+    info!("pre-baked {} text textures", baker.len());
+}
+
+// ─── Score HUD ────────────────────────────────────────────────────────────────
+
+/// Spawns the in-game UI (score/streak HUD, menu button, flash overlay) and
+/// resets the score for a fresh run. All roots are tagged `PlayingUi`.
+fn spawn_playing_ui(mut commands: Commands, mut score: ResMut<Score>) {
+    *score = Score::default();
+
+    // Score + streak readout, top-center.
+    commands
+        .spawn((
+            Node {
+                position_type: PositionType::Absolute,
+                top: Val::Px(12.0),
+                left: Val::Px(0.0),
+                right: Val::Px(0.0),
+                flex_direction: FlexDirection::Column,
+                align_items: AlignItems::Center,
+                row_gap: Val::Px(2.0),
+                ..default()
+            },
+            Pickable::IGNORE,
+            PlayingUi,
+        ))
+        .with_children(|hud| {
+            hud.spawn((
+                Text::new("0"),
+                TextFont { font_size: FontSize::Px(44.0), ..default() },
+                TextColor(Color::WHITE),
+                ScoreValue,
+            ));
+            hud.spawn((
+                Text::new("streak 0"),
+                TextFont { font_size: FontSize::Px(15.0), ..default() },
+                TextColor(Color::srgba(1.0, 1.0, 1.0, 0.85)),
+                StreakValue,
+            ));
+        });
+
+    // Menu button, top-right.
+    commands
+        .spawn((
+            Button,
+            InGameMenuButton,
+            Node {
+                position_type: PositionType::Absolute,
+                top: Val::Px(8.0),
+                right: Val::Px(8.0),
+                padding: UiRect::axes(Val::Px(12.0), Val::Px(6.0)),
+                align_items: AlignItems::Center,
+                justify_content: JustifyContent::Center,
+                border_radius: BorderRadius::all(Val::Px(6.0)),
+                ..default()
+            },
+            BackgroundColor(Color::srgba(0.0, 0.0, 0.0, 0.5)),
+            PlayingUi,
+        ))
+        .with_children(|b| {
+            b.spawn((
+                Text::new("Menu"),
+                TextFont { font_size: FontSize::Px(16.0), ..default() },
+                TextColor(Color::WHITE),
+            ));
+        });
+
+    // Full-screen flash overlay — alpha driven each frame, never blocks input.
+    commands.spawn((
+        Node {
+            position_type: PositionType::Absolute,
+            top: Val::Px(0.0),
+            left: Val::Px(0.0),
+            width: Val::Percent(100.0),
+            height: Val::Percent(100.0),
+            ..default()
+        },
+        BackgroundColor(Color::NONE),
+        Pickable::IGNORE,
+        FlashOverlay,
+        PlayingUi,
+    ));
+}
+
+fn update_score_hud(
+    score: Res<Score>,
+    mut score_q: Query<&mut Text, (With<ScoreValue>, Without<StreakValue>)>,
+    mut streak_q: Query<&mut Text, (With<StreakValue>, Without<ScoreValue>)>,
+) {
+    if !score.is_changed() {
+        return;
+    }
+    if let Ok(mut t) = score_q.single_mut() {
+        t.0 = score.correct.to_string();
+    }
+    if let Ok(mut t) = streak_q.single_mut() {
+        t.0 = format!("streak {}  ·  best {}", score.streak, score.best_streak);
+    }
+}
+
+/// Tints the screen red briefly after a wrong answer (replaces the egui overlay).
+fn update_flash_overlay(
+    flash: Res<FlashState>,
+    mut q: Query<&mut BackgroundColor, With<FlashOverlay>>,
+) {
+    let alpha = if flash.timer > 0.0 && !flash.correct {
+        (flash.timer * 2.5).min(1.0) * 0.35
+    } else {
+        0.0
+    };
+    for mut bg in q.iter_mut() {
+        *bg = BackgroundColor(Color::srgba(0.86, 0.16, 0.16, alpha));
+    }
+}
+
+fn ingame_menu_button_system(
+    q: Query<&Interaction, (Changed<Interaction>, With<InGameMenuButton>)>,
+    mut next_state: ResMut<NextState<GameState>>,
+) {
+    for interaction in q.iter() {
+        if *interaction == Interaction::Pressed {
+            next_state.set(GameState::Menu);
+        }
+    }
+}
+
+fn cleanup_playing_ui(mut commands: Commands, q: Query<Entity, With<PlayingUi>>) {
+    for e in q.iter() {
+        commands.entity(e).despawn();
+    }
+}
+
 // ─── Gate spawning ────────────────────────────────────────────────────────────
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_gate(
     commands: &mut Commands,
     gate_assets: &GateAssets,
-    text_mat: Handle<StandardMaterial>,
+    baker: &mut TextBaker,
+    images: &mut Assets<Image>,
+    materials: &mut Assets<StandardMaterial>,
     gate_z: f32,
     question: &str,
     answer_l: &str,
@@ -843,7 +1083,7 @@ fn spawn_gate(
             .id(),
     );
 
-    // ── Question crossbeam (mesh + text) ──
+    // ── Question crossbeam (beam mesh + baked-text quad) ──
     entities.push(
         commands
             .spawn((
@@ -855,21 +1095,15 @@ fn spawn_gate(
             ))
             .id(),
     );
+    let q = baker.bake(images, materials, question, TextKind::Question);
+    let qh = 1.7 * s;
     entities.push(
         commands
             .spawn((
-                Text3d::new(question),
-                Text3dStyling {
-                    size: 72.0,
-                    color: Srgba::new(0.12, 0.06, 0.01, 1.0),
-                    stroke: NonZero::new(4),
-                    stroke_color: Srgba::new(1.0, 0.95, 0.8, 1.0),
-                    world_scale: Some(Vec2::splat(1.2 * s)),
-                    ..default()
-                },
-                Mesh3d::default(),
-                MeshMaterial3d(text_mat.clone()),
-                Transform::from_xyz(0.0, 5.8 * s, gate_z + 0.1),
+                Mesh3d(gate_assets.text_quad.clone()),
+                MeshMaterial3d(q.material),
+                Transform::from_xyz(0.0, 5.8 * s, gate_z + 0.1)
+                    .with_scale(Vec3::new(qh * q.aspect, qh, 1.0)),
                 Billboard,
                 CrossbeamRise { gate_z },
             ))
@@ -877,11 +1111,11 @@ fn spawn_gate(
     );
 
     let [l0, l1] = spawn_sign(
-        commands, gate_assets, text_mat.clone(),
+        commands, gate_assets, baker, images, materials,
         gate_z, -SIGN_X_OFFSET * s, gate_assets.sign_mat_yellow.clone(), answer_l, s,
     );
     let [r0, r1] = spawn_sign(
-        commands, gate_assets, text_mat,
+        commands, gate_assets, baker, images, materials,
         gate_z, SIGN_X_OFFSET * s, gate_assets.sign_mat_blue.clone(), answer_r, s,
     );
     entities.extend([l0, l1, r0, r1]);
@@ -889,10 +1123,13 @@ fn spawn_gate(
     entities
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_sign(
     commands: &mut Commands,
     gate_assets: &GateAssets,
-    text_mat: Handle<StandardMaterial>,
+    baker: &mut TextBaker,
+    images: &mut Assets<Image>,
+    materials: &mut Assets<StandardMaterial>,
     gate_z: f32,
     x: f32,
     sign_mat: Handle<StandardMaterial>,
@@ -909,18 +1146,14 @@ fn spawn_sign(
             SignSlide { gate_z, dir },
         ))
         .id();
+    let a = baker.bake(images, materials, text, TextKind::Answer);
+    let ah = 1.5 * s;
     let label = commands
         .spawn((
-            Text3d::new(text),
-            Text3dStyling {
-                size: 96.0,
-                color: Srgba::new(0.05, 0.05, 0.1, 1.0),
-                world_scale: Some(Vec2::splat(s)),
-                ..default()
-            },
-            Mesh3d::default(),
-            MeshMaterial3d(text_mat),
-            Transform::from_xyz(x, 3.2 * s, gate_z + 0.1),
+            Mesh3d(gate_assets.text_quad.clone()),
+            MeshMaterial3d(a.material),
+            Transform::from_xyz(x, 3.2 * s, gate_z + 0.1)
+                .with_scale(Vec3::new(ah * a.aspect, ah, 1.0)),
             Billboard,
             SignSlide { gate_z, dir },
         ))
@@ -1041,6 +1274,7 @@ fn steer_system(
 fn move_system(
     time: Res<Time>,
     settings: Res<CameraSettings>,
+    score: Res<Score>,
     mut player_q: Query<(&mut Player, &mut Transform)>,
 ) {
     let Ok((mut player, mut transform)) = player_q.single_mut() else {
@@ -1051,10 +1285,13 @@ fn move_system(
     player.lateral = player
         .lateral
         .lerp(player.target_lateral, smoothing * dt);
+    // Gentle difficulty ramp: each correct answer nudges speed up, capped at +70%.
+    let ramp = 1.0 + (score.correct as f32 * 0.012).min(0.7);
+    let base = settings.player_speed * ramp;
     let speed = if player.dashing {
-        settings.player_speed * DASH_SPEED_MULT
+        base * DASH_SPEED_MULT
     } else {
-        settings.player_speed
+        base
     };
     transform.translation.z -= speed * dt;
     transform.translation.x = player.lateral;
@@ -1116,7 +1353,7 @@ fn fix_player_material(
     let mut fixed = false;
     while let Some(entity) = stack.pop() {
         if let Ok(handle) = mesh_mat_q.get(entity) {
-            if let Some(mat) = materials.get_mut(handle.id()) {
+            if let Some(mut mat) = materials.get_mut(handle.id()) {
                 mat.alpha_mode = AlphaMode::Opaque;
                 fixed = true;
             }
@@ -1126,6 +1363,17 @@ fn fix_player_material(
         }
     }
     if fixed { *done = true; }
+}
+
+/// Keeps the grass plane centered under the player so the ground appears infinite.
+fn follow_ground_system(
+    player_q: Query<&Transform, (With<Player>, Without<GroundPlane>)>,
+    mut ground_q: Query<&mut Transform, With<GroundPlane>>,
+) {
+    let Ok(p) = player_q.single() else { return };
+    for mut t in ground_q.iter_mut() {
+        t.translation.z = p.translation.z;
+    }
 }
 
 fn camera_follow_system(
@@ -1176,22 +1424,6 @@ fn apply_fov_system(
     if let Projection::Perspective(ref mut p) = *proj {
         p.fov = settings.fov_degrees.to_radians();
     }
-}
-
-fn flash_overlay_ui(mut contexts: EguiContexts, flash: Res<FlashState>) -> Result {
-    if flash.timer > 0.0 && !flash.correct {
-        let alpha = (flash.timer * 2.5).min(1.0) * 0.35;
-        let color = egui::Color32::from_rgba_unmultiplied(220, 40, 40, (alpha * 255.0) as u8);
-        let ctx = contexts.ctx_mut()?;
-        let screen = ctx.viewport_rect();
-        egui::Area::new(egui::Id::new("flash"))
-            .fixed_pos(screen.min)
-            .order(egui::Order::Foreground)
-            .show(ctx, |ui| {
-                ui.painter().rect_filled(screen, 0.0, color);
-            });
-    }
-    Ok(())
 }
 
 fn sr_stats_ui(mut contexts: EguiContexts, scheduler: Res<Scheduler>) -> Result {
@@ -1287,6 +1519,15 @@ fn manage_tiles_system(
                 MeshMaterial3d(mat),
                 Transform::from_xyz(0.0, -0.15, center_z),
             ))
+            .with_children(|t| {
+                for side in [-1.0_f32, 1.0] {
+                    t.spawn((
+                        Mesh3d(assets.rail_mesh.clone()),
+                        MeshMaterial3d(assets.rail_mat.clone()),
+                        Transform::from_xyz(side * (TILE_WIDTH / 2.0 + 0.15), 0.45, 0.0),
+                    ));
+                }
+            })
             .id();
         manager.spawned.push_back((center_z, entity));
         manager.frontier_z -= TILE_LENGTH;
@@ -1308,7 +1549,9 @@ fn manage_gates_system(
     mut manager: ResMut<GateManager>,
     mut scheduler: ResMut<Scheduler>,
     gate_assets: Res<GateAssets>,
-    text_mat: Res<TextMat>,
+    mut baker: ResMut<TextBaker>,
+    mut images: ResMut<Assets<Image>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
     settings: Res<CameraSettings>,
     player_q: Query<&Transform, With<Player>>,
 ) {
@@ -1335,7 +1578,9 @@ fn manage_gates_system(
         let entities = spawn_gate(
             &mut commands,
             &gate_assets,
-            text_mat.0.clone(),
+            &mut baker,
+            &mut images,
+            &mut materials,
             z,
             &question,
             &answer_l,
@@ -1393,6 +1638,7 @@ fn gate_check_system(
     mut post_q: Query<&mut GatePost>,
     mut flash: ResMut<FlashState>,
     mut scheduler: ResMut<Scheduler>,
+    mut score: ResMut<Score>,
 ) {
     let Ok((player_t, mut player)) = player_q.single_mut() else {
         return;
@@ -1407,6 +1653,13 @@ fn gate_check_system(
             let correct = player_side == post.correct_side;
             flash.correct = correct;
             flash.timer = 0.6;
+            if correct {
+                score.correct += 1;
+                score.streak += 1;
+                score.best_streak = score.best_streak.max(score.streak);
+            } else {
+                score.streak = 0;
+            }
             scheduler.record(post.word_index, correct);
             scheduler.gate_pass_count += 1;
         }
@@ -1475,13 +1728,20 @@ fn rise_crossbeam_system(
     }
 }
 
+/// `--screenshot` only: skip the menu and drop straight into a game so the
+/// auto-screenshot captures gameplay rather than the start menu.
+#[cfg(not(target_arch = "wasm32"))]
+fn auto_start_for_screenshot(mut next_state: ResMut<NextState<GameState>>) {
+    next_state.set(GameState::Loading);
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 fn auto_screenshot_system(mut commands: Commands, mut frame: Local<u32>) {
     *frame += 1;
-    if *frame == 30 {
+    if *frame == 200 {
         commands
             .spawn(Screenshot::primary_window())
             .observe(save_to_disk("/tmp/nihongo_screenshot.png"));
-        info!("Auto-screenshot taken (frame 30)");
+        info!("Auto-screenshot taken (frame 200)");
     }
 }
