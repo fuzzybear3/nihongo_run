@@ -1052,6 +1052,14 @@ fn cleanup_playing_ui(mut commands: Commands, q: Query<Entity, With<PlayingUi>>)
 
 // ─── Gate spawning ────────────────────────────────────────────────────────────
 
+/// Sizes a text quad of the given `aspect` (width/height) to sit inside an
+/// `max_w` × `max_h` box without exceeding `base_h`, so long words shrink to fit
+/// the sign/beam instead of overflowing it.
+fn fit_text(aspect: f32, base_h: f32, max_w: f32, max_h: f32) -> Vec3 {
+    let h = base_h.min(max_h).min(max_w / aspect.max(0.01));
+    Vec3::new(h * aspect, h, 1.0)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn spawn_gate(
     commands: &mut Commands,
@@ -1096,14 +1104,15 @@ fn spawn_gate(
             .id(),
     );
     let q = baker.bake(images, materials, question, TextKind::Question);
-    let qh = 1.7 * s;
+    // Crossbeam mesh is 2.5 wide × 2.5 tall — keep text inside it.
+    let q_scale = fit_text(q.aspect, 1.7 * s, 2.3 * s, 2.1 * s);
     entities.push(
         commands
             .spawn((
                 Mesh3d(gate_assets.text_quad.clone()),
                 MeshMaterial3d(q.material),
                 Transform::from_xyz(0.0, 5.8 * s, gate_z + 0.1)
-                    .with_scale(Vec3::new(qh * q.aspect, qh, 1.0)),
+                    .with_scale(q_scale),
                 Billboard,
                 CrossbeamRise { gate_z },
             ))
@@ -1147,13 +1156,14 @@ fn spawn_sign(
         ))
         .id();
     let a = baker.bake(images, materials, text, TextKind::Answer);
-    let ah = 1.5 * s;
+    // Sign mesh is 3.0 wide × 2.5 tall — keep text inside it.
+    let a_scale = fit_text(a.aspect, 1.5 * s, 2.7 * s, 2.0 * s);
     let label = commands
         .spawn((
             Mesh3d(gate_assets.text_quad.clone()),
             MeshMaterial3d(a.material),
             Transform::from_xyz(x, 3.2 * s, gate_z + 0.1)
-                .with_scale(Vec3::new(ah * a.aspect, ah, 1.0)),
+                .with_scale(a_scale),
             Billboard,
             SignSlide { gate_z, dir },
         ))
@@ -1729,19 +1739,43 @@ fn rise_crossbeam_system(
 }
 
 /// `--screenshot` only: skip the menu and drop straight into a game so the
-/// auto-screenshot captures gameplay rather than the start menu.
+/// auto-screenshot captures gameplay. A deck flag (`--n5`, `--katakana`,
+/// `--dakuten`, `--numbers`) picks the deck; otherwise the default is used.
 #[cfg(not(target_arch = "wasm32"))]
-fn auto_start_for_screenshot(mut next_state: ResMut<NextState<GameState>>) {
+fn auto_start_for_screenshot(
+    mut next_state: ResMut<NextState<GameState>>,
+    mut deck: ResMut<DeckChoice>,
+) {
+    let args: Vec<String> = std::env::args().collect();
+    let has = |s: &str| args.iter().any(|a| a == s);
+    if has("--n5") {
+        *deck = DeckChoice::N5Vocab;
+    } else if has("--katakana") {
+        *deck = DeckChoice::Katakana;
+    } else if has("--dakuten") {
+        *deck = DeckChoice::Dakuten;
+    } else if has("--numbers") {
+        *deck = DeckChoice::Numbers;
+    }
     next_state.set(GameState::Loading);
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-fn auto_screenshot_system(mut commands: Commands, mut frame: Local<u32>) {
+fn auto_screenshot_system(
+    mut commands: Commands,
+    mut frame: Local<u32>,
+    state: Res<State<GameState>>,
+) {
+    // In `--play` mode wait until gameplay is actually running (decks may load
+    // asynchronously) before counting frames; otherwise capture the menu.
+    if std::env::args().any(|a| a == "--play") && *state.get() != GameState::Playing {
+        return;
+    }
     *frame += 1;
-    if *frame == 200 {
+    if *frame == 120 {
         commands
             .spawn(Screenshot::primary_window())
             .observe(save_to_disk("/tmp/nihongo_screenshot.png"));
-        info!("Auto-screenshot taken (frame 200)");
+        info!("Auto-screenshot taken (120 frames in)");
     }
 }
